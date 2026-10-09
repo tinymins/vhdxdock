@@ -60,9 +60,14 @@ foreach ($candidate in @($req.candidates)) {
             if ($partition.IsBoot -or $partition.IsSystem) { $protected = $true }
             $openPaths = @($partition.AccessPaths)
             # AccessPaths can lag behind DriveLetter after Add-PartitionAccessPath.
-            # A cached letter is accepted only when the root is actually accessible.
+            # Cached letters must still map to this exact disk and partition.
             if ($partition.DriveLetter -and ([string]$partition.DriveLetter) -match '^[A-Za-z]$') {
-                $openPaths += ([string]$partition.DriveLetter + ':\')
+                $letterRoot = [string]$partition.DriveLetter + ':\'
+                if (Test-Path -LiteralPath $letterRoot -PathType Container) {
+                    $mapped = @(Get-Partition -DriveLetter ([char]$partition.DriveLetter) -ErrorAction Stop)
+                    if ($mapped.Count -ne 1 -or $mapped[0].DiskNumber -ne $disk.Number -or $mapped[0].PartitionNumber -ne $partition.PartitionNumber) { throw '盘符已指向其他磁盘或分区，请刷新后重试' }
+                    $openPaths += $letterRoot
+                }
             }
             foreach ($access in $openPaths) {
                 if ($access -and $access -notlike '\\?\Volume{*' -and (Test-Path -LiteralPath ([string]$access) -PathType Container)) {
@@ -311,7 +316,11 @@ foreach ($partition in $partitions) {
     $accessPaths = @($partition.AccessPaths | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
     if ($partition.DriveLetter -and ([string]$partition.DriveLetter) -match '^[A-Za-z]$') {
         $letterRoot = [string]$partition.DriveLetter + ':\'
-        if (Test-Path -LiteralPath $letterRoot -PathType Container) { $accessPaths += $letterRoot }
+        if (Test-Path -LiteralPath $letterRoot -PathType Container) {
+            $mapped = @(Get-Partition -DriveLetter ([char]$partition.DriveLetter) -ErrorAction Stop)
+            if ($mapped.Count -ne 1 -or $mapped[0].DiskNumber -ne $disk.Number -or $mapped[0].PartitionNumber -ne $partition.PartitionNumber) { throw '盘符已指向其他磁盘或分区，拒绝卸载' }
+            $accessPaths += $letterRoot
+        }
     }
     if ($accessPaths.Count -eq 0 -and [string]$partition.Type -ne 'Reserved') { throw '无法确认分区卷路径，拒绝卸载' }
     foreach ($access in $accessPaths) {
@@ -439,7 +448,11 @@ ConvertTo-Json -InputObject @{uniqueId=[string]$disk.UniqueId} -Compress
 function Get-CimInstance { @() }
 function Get-Disk { [pscustomobject]@{Number=999;IsBoot=$false;IsSystem=$false;IsReadOnly=$false;PartitionStyle='GPT'} }
 function Get-DiskImage { [pscustomobject]@{ImagePath='test-diff.vhdx'} }
-function Get-Partition { [pscustomobject]@{PartitionNumber=2;DriveLetter=[char]'F';AccessPaths=@('\\?\Volume{fixture}\');IsBoot=$false;IsSystem=$false} }
+function Get-Partition {
+    param($DriveLetter,$DiskNumber)
+    if ($DriveLetter) { [pscustomobject]@{DiskNumber=$req.mappedDisk;PartitionNumber=$req.mappedPartition} }
+    else { [pscustomobject]@{DiskNumber=999;PartitionNumber=2;Type='Basic';DriveLetter=[char]'F';AccessPaths=@('\\?\Volume{fixture}\');IsBoot=$false;IsSystem=$false} }
+}
 function Test-Path {
     param($LiteralPath,$PathType)
     if ($PathType -ne 'Container' -or $LiteralPath -ne 'F:\') { throw 'root accessibility check was bypassed or malformed' }
@@ -447,11 +460,19 @@ function Test-Path {
 }
 "#;
             let script = format!("{mock}\n{DISCOVER}");
-            let request = |accessible| json!({"accessible":accessible,"candidates":[{"physical":r"\\.\PhysicalDrive999","image":"test-diff.vhdx"}]});
-            let ready = process::powershell(&script, &request(true)).unwrap();
+            let request = |accessible, mapped_disk, mapped_partition| json!({"accessible":accessible,"mappedDisk":mapped_disk,"mappedPartition":mapped_partition,"physical":r"\\.\PhysicalDrive999","expectedVolumes":["F:\\"],"candidates":[{"physical":r"\\.\PhysicalDrive999","image":"test-diff.vhdx"}]});
+            let ready = process::powershell(&script, &request(true, 999, 2)).unwrap();
             assert_eq!(ready[0]["volumes"], json!(["F:\\"]));
-            let unavailable = process::powershell(&script, &request(false)).unwrap();
+            let unavailable = process::powershell(&script, &request(false, 999, 2)).unwrap();
             assert_eq!(unavailable[0]["volumes"], json!([]));
+            let eject = format!("{mock}\n{EJECT_ROOTS}");
+            assert!(process::powershell(&eject, &request(true, 999, 2)).is_ok());
+            for (disk, partition) in [(1000, 2), (999, 3)] {
+                let wrong = process::powershell(&script, &request(true, disk, partition)).unwrap();
+                assert_eq!(wrong[0]["volumes"], json!([]));
+                assert_eq!(wrong[0]["can_eject"], json!(false));
+                assert!(process::powershell(&eject, &request(true, disk, partition)).is_err());
+            }
         }
         #[test]
         fn partial_mount_and_relocation_are_rejected_before_disk_operations() {
