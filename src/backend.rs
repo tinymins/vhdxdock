@@ -95,10 +95,10 @@ ConvertTo-Json -InputObject @($rows) -Depth 5 -Compress
         let candidates = virtual_disk::attached_paths()?;
         let payload = json!({"candidates": candidates.iter().map(|p| {
             let (physical, error) = match virtual_disk::canonical_physical_device(&p.physical) {
-                Ok(device) => (device, None),
+                Ok(device) => (device, p.warning.clone()),
                 Err(error) => (p.physical.clone(), Some(format!("{error:#}"))),
             };
-            json!({"physical": physical, "enumeratedPhysical":p.physical, "normalizationError":error, "image": p.image})
+            json!({"physical": physical, "enumeratedPhysical":p.enumerated, "normalizationError":error, "image": p.image})
         }).collect::<Vec<_>>()});
         let value = process::powershell(DISCOVER, &payload)?;
         let mut rows: Vec<MountedImage> =
@@ -293,7 +293,7 @@ ConvertTo-Json -InputObject $snapshot -Depth 7 -Compress
             .map(|entries| {
                 entries
                     .into_iter()
-                    .map(|p| json!({"physical":p.physical,"image":p.image}))
+                    .map(|p| json!({"enumerated":p.enumerated,"physical":p.physical,"image":p.image,"warning":p.warning}))
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();

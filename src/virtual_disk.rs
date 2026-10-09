@@ -49,8 +49,10 @@ pub fn validate_parent(_: &Path, _: &Path) -> Result<()> {
 
 #[derive(Debug)]
 pub struct AttachedPath {
+    pub enumerated: String,
     pub physical: String,
     pub image: Option<std::path::PathBuf>,
+    pub warning: Option<String>,
 }
 #[cfg(not(windows))]
 pub fn attached_paths() -> Result<Vec<AttachedPath>> {
@@ -494,8 +496,7 @@ mod native {
     pub fn physical_path(path: &Path) -> Result<String> {
         physical(&open(path, false, false)?)
     }
-    /// GetAllAttachedVirtualDiskPhysicalPaths may enumerate device-interface
-    /// names. Resolve the actual device number rather than parsing that name.
+    /// Resolve a device path's actual disk number rather than parsing its name.
     pub fn canonical_physical_device(device: &str) -> Result<String> {
         let p = wide(Path::new(device))?;
         let handle = Handle(unsafe {
@@ -641,6 +642,47 @@ mod native {
         }
         Ok(None)
     }
+    fn enumerated_image_path(enumerated: &str) -> Option<PathBuf> {
+        let path = Path::new(enumerated);
+        paths::image_format(path).ok().map(|_| path.to_path_buf())
+    }
+    fn resolve_enumerated(enumerated: String) -> AttachedPath {
+        // Despite the API name, Windows returns backing image filenames here.
+        // Resolve those with the VHD API before passing anything to Storage.
+        if let Some(image) = enumerated_image_path(&enumerated) {
+            return match physical_path(&image) {
+                Ok(physical) => AttachedPath {
+                    enumerated,
+                    physical,
+                    image: Some(image),
+                    warning: None,
+                },
+                Err(error) => AttachedPath {
+                    physical: enumerated.clone(),
+                    enumerated,
+                    image: Some(image),
+                    warning: Some(format!("无法解析已枚举镜像的设备：{error:#}")),
+                },
+            };
+        }
+        // Retain device/interface fallback for unknown enumeration variants.
+        // Failed resolution remains a protected row rather than disappearing.
+        let image = dependency_image(&enumerated).ok().flatten();
+        match canonical_physical_device(&enumerated) {
+            Ok(physical) => AttachedPath {
+                enumerated,
+                physical,
+                image,
+                warning: None,
+            },
+            Err(error) => AttachedPath {
+                physical: enumerated.clone(),
+                enumerated,
+                image,
+                warning: Some(format!("无法解析已枚举设备：{error:#}")),
+            },
+        }
+    }
     pub fn attached_paths() -> Result<Vec<AttachedPath>> {
         let mut chars = vec![0u16; 32768];
         let mut bytes = (chars.len() * 2) as u32;
@@ -661,9 +703,8 @@ mod native {
             .split(|&c| c == 0)
             .filter(|s| !s.is_empty())
             .map(|s| {
-                let physical = String::from_utf16_lossy(s);
-                let image = dependency_image(&physical).ok().flatten();
-                AttachedPath { physical, image }
+                let enumerated = String::from_utf16_lossy(s);
+                resolve_enumerated(enumerated)
             })
             .collect())
     }
@@ -674,6 +715,25 @@ mod native {
         use sha2::{Digest, Sha256};
         fn digest(path: &Path) -> Vec<u8> {
             Sha256::digest(std::fs::read(path).unwrap()).to_vec()
+        }
+        #[test]
+        fn native_enumeration_distinguishes_image_names_from_devices() {
+            for name in [
+                r"C:\Temp\archive-diff.vhdx",
+                r"D:\备份\base.VHD",
+                r"E:\build.vhdx.partial",
+            ] {
+                assert_eq!(enumerated_image_path(name), Some(PathBuf::from(name)));
+            }
+            assert!(enumerated_image_path(r"\\.\PhysicalDrive2").is_none());
+            assert!(enumerated_image_path(r"\\?\scsi#disk#fixture").is_none());
+            let missing =
+                resolve_enumerated(r"C:\vhdxdock-nonexistent-fixture\missing.vhdx".into());
+            assert!(missing.image.is_some());
+            assert!(
+                missing.warning.is_some(),
+                "unresolved entries must remain protected, not disappear"
+            );
         }
 
         #[test]
