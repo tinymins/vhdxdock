@@ -32,8 +32,19 @@ enum Event {
         result: Result<Vec<MountedImage>, String>,
     },
     Progress(Progress),
-    Built(Result<BuildResult, String>),
+    Built(Result<BuildResult, BuildFailure>),
     Opened(Result<(), String>),
+}
+
+struct BuildFailure {
+    message: String,
+    clean_cancel: bool,
+}
+
+enum LogCommand {
+    Write(String),
+    Pause(mpsc::Sender<()>),
+    Resume,
 }
 
 struct EjectConfirmation {
@@ -54,7 +65,7 @@ pub struct DockApp {
     build_started: Option<Instant>,
     build_result: Option<BuildResult>,
     logs: VecDeque<String>,
-    log_tx: Option<mpsc::Sender<String>>,
+    log_tx: Option<mpsc::Sender<LogCommand>>,
     notice: Option<(String, bool)>,
     diff_manual: bool,
     last_auto_base: String,
@@ -191,7 +202,7 @@ impl DockApp {
     fn log(&mut self, message: impl Into<String>) {
         let message = message.into();
         if let Some(writer) = &self.log_tx {
-            let _ = writer.send(message.clone());
+            let _ = writer.send(LogCommand::Write(message.clone()));
         }
         self.logs.push_back(message);
         while self.logs.len() > 400 {
@@ -206,7 +217,9 @@ impl DockApp {
     }
 
     fn save(&mut self) {
-        if !self.operations_allowed() {
+        // A portable executable may live inside the folder being archived.
+        // Keep that source stable until the builder's final verification ends.
+        if !self.operations_allowed() || self.building {
             return;
         }
         if let Err(error) = self.settings.save() {
@@ -334,7 +347,7 @@ impl DockApp {
     }
 
     fn start_build(&mut self) {
-        if !self.operations_allowed() {
+        if !self.operations_allowed() || self.exit_when_idle {
             return;
         }
         let request = match (
@@ -369,16 +382,75 @@ impl DockApp {
             request.source.display(),
             request.output.display()
         ));
+        let log_paused = self.log_tx.as_ref().and_then(|writer| {
+            let (ack, receiver) = mpsc::channel();
+            writer.send(LogCommand::Pause(ack)).ok().map(|_| receiver)
+        });
         let cancel = self.cancel.clone();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
+            // The acknowledgement is queued behind all prior log writes. The
+            // builder must not scan until the portable session log is stable.
+            if let Some(ack) = log_paused {
+                let _ = ack.recv();
+            }
             let progress_tx = tx.clone();
-            let result = builder::build(request, cancel, move |progress| {
-                let _ = progress_tx.send(Event::Progress(progress));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                builder::build(request, cancel, move |progress| {
+                    let _ = progress_tx.send(Event::Progress(progress));
+                })
+            }))
+            .map_err(|panic| {
+                let detail = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or("未知内部错误");
+                BuildFailure {
+                    message: format!("制作任务异常终止：{detail}；请检查未完成镜像的挂载状态。"),
+                    clean_cancel: false,
+                }
             })
-            .map_err(|e| format!("{e:#}"));
+            .and_then(|result| {
+                result.map_err(|error| BuildFailure {
+                    clean_cancel: builder::is_clean_cancellation(&error),
+                    message: format!("{error:#}"),
+                })
+            });
             let _ = tx.send(Event::Built(result));
         });
+    }
+
+    /// Returns whether an earlier cancel-and-exit request can safely continue.
+    /// Failures, including unsuccessful cleanup, must remain visible to users.
+    fn finish_build(&mut self, result: Result<BuildResult, BuildFailure>) -> bool {
+        self.building = false;
+        self.close_confirmation = false;
+        if let Some(writer) = &self.log_tx {
+            let _ = writer.send(LogCommand::Resume);
+        }
+        let safe_to_exit = match result {
+            Ok(result) => {
+                self.report(
+                    format!(
+                        "制作完成：{}（{}）",
+                        result.output.display(),
+                        paths::format_bytes(result.image_bytes)
+                    ),
+                    false,
+                );
+                self.build_result = Some(result);
+                true
+            }
+            Err(error) => {
+                self.report(error.message, !error.clean_cancel);
+                error.clean_cancel
+            }
+        };
+        if !safe_to_exit {
+            self.exit_when_idle = false;
+        }
+        self.exit_when_idle && safe_to_exit
     }
 
     fn poll_events(&mut self, ctx: &egui::Context) {
@@ -404,26 +476,11 @@ impl DockApp {
                     self.progress = progress;
                 }
                 Event::Built(result) => {
-                    self.building = false;
-                    // A close prompt opened during a build should not claim the
-                    // task is still running after it has naturally completed.
-                    self.close_confirmation = false;
-                    match result {
-                        Ok(result) => {
-                            self.report(
-                                format!(
-                                    "制作完成：{}（{}）",
-                                    result.output.display(),
-                                    paths::format_bytes(result.image_bytes)
-                                ),
-                                false,
-                            );
-                            self.build_result = Some(result);
-                        }
-                        Err(error) => self.report(error, !self.cancel.load(Ordering::Relaxed)),
-                    }
-                    if self.exit_when_idle {
+                    let close = self.finish_build(result);
+                    if self.config_dirty || close {
                         self.save();
+                    }
+                    if close {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 }
@@ -845,6 +902,7 @@ impl DockApp {
                 if ui
                     .add_enabled(
                         !self.building
+                            && !self.exit_when_idle
                             && !self.settings.source_path.trim().is_empty()
                             && !self.settings.output_path.trim().is_empty(),
                         primary("开始制作", 124.0),
@@ -1219,7 +1277,8 @@ impl eframe::App for DockApp {
                     });
             });
         self.dialogs(ctx);
-        if self.config_dirty && self.last_save.elapsed() >= Duration::from_secs(2) {
+        if self.config_dirty && !self.building && self.last_save.elapsed() >= Duration::from_secs(2)
+        {
             self.save();
         }
         if self.building || self.disk_busy.is_some() {
@@ -1237,10 +1296,9 @@ fn primary(label: &str, width: f32) -> egui::Button<'_> {
         .corner_radius(6.0)
 }
 
-fn start_log_writer() -> mpsc::Sender<String> {
-    let (tx, rx) = mpsc::channel::<String>();
+fn start_log_writer() -> mpsc::Sender<LogCommand> {
+    let (tx, rx) = mpsc::channel::<LogCommand>();
     std::thread::spawn(move || {
-        use std::io::Write;
         let directory = config::data_dir().join("logs");
         if std::fs::create_dir_all(&directory).is_err() {
             return;
@@ -1249,22 +1307,39 @@ fn start_log_writer() -> mpsc::Sender<String> {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let Ok(mut file) = std::fs::OpenOptions::new()
+        let Ok(file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(directory.join(format!("session-{timestamp}-{}.log", std::process::id())))
         else {
             return;
         };
-        for message in rx {
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let _ = writeln!(file, "[{timestamp}] {message}");
-        }
+        run_log_writer(file, rx);
     });
     tx
+}
+
+fn run_log_writer(mut file: std::fs::File, commands: mpsc::Receiver<LogCommand>) {
+    use std::io::Write;
+    let mut paused = false;
+    for command in commands {
+        match command {
+            LogCommand::Write(message) if !paused => {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let _ = writeln!(file, "[{timestamp}] {message}");
+            }
+            LogCommand::Write(_) => {}
+            LogCommand::Pause(ack) => {
+                paused = true;
+                let _ = file.flush();
+                let _ = ack.send(());
+            }
+            LogCommand::Resume => paused = false,
+        }
+    }
 }
 
 fn card(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
@@ -1595,5 +1670,90 @@ mod tests {
             !reloaded.diff_manual,
             "Automatically generated paths should remain automatic across restarts"
         );
+    }
+
+    #[test]
+    fn cancellation_request_does_not_hide_cleanup_failure_or_exit() {
+        let mut app = DockApp::with_settings(AppConfig::default());
+        app.building = true;
+        app.exit_when_idle = true;
+        app.cancel.store(true, Ordering::Relaxed);
+        let close = app.finish_build(Err(BuildFailure {
+            message: "清理时无法卸载未完成镜像；请手动卸载".into(),
+            clean_cancel: false,
+        }));
+        assert!(
+            !close,
+            "A cleanup failure must never close the error window"
+        );
+        assert!(!app.exit_when_idle);
+        assert!(!app.building);
+        assert!(
+            app.notice.as_ref().is_some_and(|(_, error)| *error),
+            "Failure must be shown in red even if cancellation was requested"
+        );
+    }
+
+    #[test]
+    fn clean_cancellation_can_complete_cancel_and_exit() {
+        let mut app = DockApp::with_settings(AppConfig::default());
+        app.building = true;
+        app.exit_when_idle = true;
+        app.cancel.store(true, Ordering::Relaxed);
+        let close = app.finish_build(Err(BuildFailure {
+            message: "操作已取消；未完成镜像和日志已保留".into(),
+            clean_cancel: true,
+        }));
+        assert!(close);
+        assert!(!app.building);
+        assert!(app.notice.as_ref().is_some_and(|(_, error)| !error));
+    }
+
+    #[test]
+    fn config_save_is_deferred_while_builder_reads_source() {
+        let mut app = DockApp::with_settings(AppConfig::default());
+        app.building = true;
+        app.config_dirty = true;
+        let last_save = app.last_save;
+        app.save();
+        assert!(
+            app.config_dirty,
+            "Changes must remain pending until the build ends"
+        );
+        assert_eq!(app.last_save, last_save);
+    }
+
+    #[test]
+    fn logger_acknowledges_prior_writes_and_stays_stable_until_resume() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.log");
+        let file = std::fs::File::create(&path).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || run_log_writer(file, rx));
+        let pause = |tx: &mpsc::Sender<LogCommand>| {
+            let (ack, receiver) = mpsc::channel();
+            tx.send(LogCommand::Pause(ack)).unwrap();
+            receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        };
+        tx.send(LogCommand::Write("before scan".into())).unwrap();
+        pause(&tx);
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert!(before.contains("before scan"));
+        tx.send(LogCommand::Write("during scan".into())).unwrap();
+        pause(&tx);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "Paused GUI logging must not mutate an archived source"
+        );
+        tx.send(LogCommand::Resume).unwrap();
+        tx.send(LogCommand::Write("after verification".into()))
+            .unwrap();
+        pause(&tx);
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("after verification"));
+        assert!(!after.contains("during scan"));
+        drop(tx);
+        writer.join().unwrap();
     }
 }

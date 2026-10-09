@@ -2,7 +2,7 @@
 name = "vhdxdock"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.90"
 description = "Windows VHDX image builder and NAS-backed differencing disk manager"
 license = "MIT"
 repository = "https://github.com/tinymins/vhdxdock"

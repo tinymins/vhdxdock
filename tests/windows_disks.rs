@@ -106,6 +106,35 @@ fn scratch_differencing_lifecycle_preserves_base() -> Result<()> {
         b"immutable base fixture"
     );
     fs::write(root.join("child-only.txt"), b"persistent local writes")?;
+    let original_device = virtual_disk::physical_path(&diff)?;
+    let repeated = backend::mount(MountRequest {
+        base: base.clone(),
+        diff: diff.clone(),
+        drive_letter: None,
+    })?;
+    assert_eq!(
+        repeated
+            .iter()
+            .filter(|row| paths::same_path(&row.image_path, &diff))
+            .count(),
+        1,
+        "repeated mount created a duplicate disk record"
+    );
+    assert_eq!(
+        virtual_disk::physical_path(&diff)?,
+        original_device,
+        "repeated mount changed the physical device"
+    );
+    assert_eq!(
+        mounted_root(&diff)?,
+        root,
+        "repeated mount changed the volume root"
+    );
+    assert_eq!(
+        fs::read(root.join("child-only.txt"))?,
+        b"persistent local writes",
+        "repeated mount lost local changes"
+    );
     backend::unmount(&diff)?;
     assert_eq!(digest(&base)?, base_hash, "base changed after guest write");
 
@@ -154,5 +183,88 @@ fn scratch_differencing_lifecycle_preserves_base() -> Result<()> {
     virtual_disk::create_difference(&old_base, &old_diff)?;
     virtual_disk::validate_parent(&old_diff, &old_base)?;
     assert_eq!(digest(&old_base)?, old_hash);
+    Ok(())
+}
+
+fn create_independent_base(scratch: &mut Scratch, name: &str, sentinel: &[u8]) -> Result<PathBuf> {
+    let partial = scratch.image(&format!("{name}.vhdx.partial"));
+    let base = scratch.image(&format!("{name}.vhdx"));
+    virtual_disk::create_dynamic(&partial, 128 * 1024 * 1024)?;
+    let root = backend::initialize_new_virtual_disk(&partial, true)?;
+    fs::write(root.join("base-sentinel.txt"), sentinel)?;
+    virtual_disk::detach(&partial)?;
+    fs::rename(&partial, &base)?;
+    let mut permissions = fs::metadata(&base)?.permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&base, permissions)?;
+    Ok(base)
+}
+
+#[test]
+#[ignore = "requires Windows elevation and VHDXDOCK_RUN_DISK_TESTS=1; only independent fresh scratch images are modified"]
+fn two_independent_mounts_eject_only_the_requested_disk() -> Result<()> {
+    enable_test()?;
+    let mut scratch = Scratch::new()?;
+    // Each base is independently initialized, giving its GPT disk and volumes
+    // distinct identities. Copying one base would introduce signature conflicts.
+    let base_a = create_independent_base(&mut scratch, "independent-a", b"base A")?;
+    let base_b = create_independent_base(&mut scratch, "independent-b", b"base B")?;
+    let diff_a = scratch.image("independent-a-diff.vhdx");
+    let diff_b = scratch.image("independent-b-diff.vhdx");
+    let hash_a = digest(&base_a)?;
+    let hash_b = digest(&base_b)?;
+    backend::mount(MountRequest {
+        base: base_a.clone(),
+        diff: diff_a.clone(),
+        drive_letter: None,
+    })?;
+    let root_a = mounted_root(&diff_a)?;
+    fs::write(root_a.join("child-a.txt"), b"writes A")?;
+    let rows = backend::mount(MountRequest {
+        base: base_b.clone(),
+        diff: diff_b.clone(),
+        drive_letter: None,
+    })?;
+    assert_eq!(
+        rows.iter()
+            .filter(|row| paths::same_path(&row.image_path, &diff_a))
+            .count(),
+        1
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| paths::same_path(&row.image_path, &diff_b))
+            .count(),
+        1
+    );
+    let root_b = mounted_root(&diff_b)?;
+    let device_b = virtual_disk::physical_path(&diff_b)?;
+    assert_ne!(virtual_disk::physical_path(&diff_a)?, device_b);
+    assert_ne!(root_a, root_b);
+    assert_eq!(fs::read(root_a.join("base-sentinel.txt"))?, b"base A");
+    assert_eq!(fs::read(root_b.join("base-sentinel.txt"))?, b"base B");
+    fs::write(root_b.join("child-b.txt"), b"writes B")?;
+
+    backend::unmount(&diff_a)?;
+    let rows = backend::list_mounted()?;
+    assert!(
+        !rows
+            .iter()
+            .any(|row| paths::same_path(&row.image_path, &diff_a)),
+        "ejected disk A remained in the mounted list"
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| paths::same_path(&row.image_path, &diff_b))
+            .count(),
+        1,
+        "ejecting A affected B's mounted record"
+    );
+    assert_eq!(virtual_disk::physical_path(&diff_b)?, device_b);
+    assert_eq!(fs::read(root_b.join("child-b.txt"))?, b"writes B");
+    fs::write(root_b.join("after-a-eject.txt"), b"B stays writable")?;
+    backend::unmount(&diff_b)?;
+    assert_eq!(digest(&base_a)?, hash_a);
+    assert_eq!(digest(&base_b)?, hash_b);
     Ok(())
 }

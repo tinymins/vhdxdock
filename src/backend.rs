@@ -54,7 +54,9 @@ foreach ($candidate in @($req.candidates)) {
         } catch { }
         $protected = [bool]($disk.IsBoot -or $disk.IsSystem)
         $readOnly = [bool]$disk.IsReadOnly
-        foreach ($partition in @(Get-Partition -DiskNumber $disk.Number -ErrorAction Stop)) {
+        $partitions = @()
+        if ($disk.PartitionStyle -ne 'RAW') { $partitions = @(Get-Partition -DiskNumber $disk.Number -ErrorAction Stop) }
+        foreach ($partition in $partitions) {
             if ($partition.IsBoot -or $partition.IsSystem) { $protected = $true }
             foreach ($access in @($partition.AccessPaths)) {
                 if ($access -and $access -notlike '\\?\Volume{*') {
@@ -152,6 +154,8 @@ ConvertTo-Json -InputObject @{ok=$true} -Compress
     pub fn mount(request: MountRequest) -> Result<Vec<MountedImage>> {
         let base = paths::resolve(&request.base)?;
         let diff = paths::resolve(&request.diff)?;
+        ensure_finalized(&base)?;
+        ensure_finalized(&diff)?;
         paths::ensure_local(&diff)?;
         if paths::same_path(&base, &diff) {
             bail!("基础镜像与差分不能是同一个文件")
@@ -164,12 +168,15 @@ ConvertTo-Json -InputObject @{ok=$true} -Compress
                 bail!("盘符必须为 A 到 Z")
             }
         }
-        let base_info = virtual_disk::inspect(&base).context("无法访问基础镜像")?;
-        if base_info.attached {
-            let row = list_mounted()?
-                .into_iter()
-                .find(|r| paths::same_path(&r.image_path, &base));
-            if row.is_none_or(|r| !r.read_only) {
+        virtual_disk::inspect(&base).context("无法访问基础镜像")?;
+        let mounted = list_mounted()?;
+        // A backing parent can be loaded by a child without being directly
+        // attached. Only a discovered row for the base itself is a direct mount.
+        if let Some(row) = mounted
+            .iter()
+            .find(|r| paths::same_path(&r.image_path, &base))
+        {
+            if !row.read_only || row.warning.is_some() {
                 bail!("基础镜像已直接挂载为可写或无法确认只读，请先卸载基础镜像")
             }
         }
@@ -199,7 +206,7 @@ ConvertTo-Json -InputObject @{ok=$true} -Compress
             )
         }
         if child.attached {
-            return list_mounted();
+            return verify_mount_rows(mounted, &diff);
         }
         virtual_disk::attach(&diff)?;
         let assigned = (|| -> Result<()> {
@@ -216,7 +223,67 @@ ConvertTo-Json -InputObject @{ok=$true} -Compress
             }
             return Err(error);
         }
-        list_mounted()
+        verify_mount_rows(list_mounted()?, &diff)
+            .context("镜像已连接，但挂载状态未通过检查；请刷新查看实际状态")
+    }
+    fn ensure_finalized(path: &Path) -> Result<()> {
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("partial"))
+        {
+            bail!(
+                ".partial 是尚未完成的镜像，不能挂载或重新定位：{}",
+                path.display()
+            )
+        }
+        Ok(())
+    }
+    fn verify_mount_rows(rows: Vec<MountedImage>, diff: &Path) -> Result<Vec<MountedImage>> {
+        let row = rows
+            .iter()
+            .find(|r| paths::same_path(&r.image_path, diff))
+            .context("Windows 未返回目标差分镜像的挂载记录")?;
+        if row.volumes.is_empty() {
+            bail!("差分镜像没有可打开的卷")
+        }
+        if row.read_only {
+            bail!("差分镜像处于只读状态")
+        }
+        if let Some(warning) = &row.warning {
+            bail!("差分镜像状态无法确认：{warning}")
+        }
+        Ok(rows)
+    }
+    const EJECT_ROOTS: &str = r#"
+if ([string]$req.physical -notmatch '^\\\\\.\\PhysicalDrive(\d+)$') { throw '设备路径无效' }
+$disk = Get-Disk -Number ([int]$Matches[1]) -ErrorAction Stop
+if ($disk.IsBoot -or $disk.IsSystem) { throw '禁止卸载系统磁盘' }
+$pageRoots = @(Get-CimInstance Win32_PageFileUsage -ErrorAction Stop | ForEach-Object { [IO.Path]::GetPathRoot($_.Name) })
+$roots = @()
+$partitions = @()
+if ($disk.PartitionStyle -ne 'RAW') { $partitions = @(Get-Partition -DiskNumber $disk.Number -ErrorAction Stop) }
+foreach ($partition in $partitions) {
+    if ($partition.IsBoot -or $partition.IsSystem) { throw '禁止卸载系统分区' }
+    # AccessPaths contains GUID roots as well as letters and mounted folders.
+    # Get-Volume errors must never silently remove a volume from the lock set.
+    $accessPaths = @($partition.AccessPaths | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if ($accessPaths.Count -eq 0 -and [string]$partition.Type -ne 'Reserved') { throw '无法确认分区卷路径，拒绝卸载' }
+    foreach ($access in $accessPaths) {
+        if (-not ([string]$access).EndsWith('\')) { throw '卷路径未以反斜杠结束，拒绝卸载' }
+        if ($pageRoots -contains [string]$access) { throw '禁止卸载分页文件所在磁盘' }
+        $roots += [string]$access
+    }
+}
+foreach ($expected in @($req.expectedVolumes)) {
+    if ($roots -notcontains [string]$expected) { throw '磁盘卷路径发生变化，拒绝卸载，请刷新后重试' }
+}
+ConvertTo-Json -InputObject @($roots | Select-Object -Unique) -Compress
+"#;
+    fn verify_eject_roots(roots: &[String], image: &MountedImage) -> Result<()> {
+        if !image.volumes.is_empty() && roots.is_empty() {
+            bail!("已挂载磁盘未返回任何卷路径，拒绝绕过卷锁卸载")
+        }
+        Ok(())
     }
     pub fn unmount(path: &Path) -> Result<()> {
         let path = paths::resolve(path)?;
@@ -231,26 +298,18 @@ ConvertTo-Json -InputObject @{ok=$true} -Compress
             )
         }
         let roots = process::powershell(
-            r#"
-if ([string]$req.physical -notmatch '^\\\\\.\\PhysicalDrive(\d+)$') { throw '设备路径无效' }
-$disk = Get-Disk -Number ([int]$Matches[1]) -ErrorAction Stop
-if ($disk.IsBoot -or $disk.IsSystem) { throw '禁止卸载系统磁盘' }
-$roots = @()
-foreach ($partition in @(Get-Partition -DiskNumber $disk.Number -ErrorAction Stop)) {
-    if ($partition.IsBoot -or $partition.IsSystem) { throw '禁止卸载系统分区' }
-    $volume = $partition | Get-Volume -ErrorAction SilentlyContinue
-    if ($volume -and $volume.Path) { $roots += [string]$volume.Path }
-}
-ConvertTo-Json -InputObject @($roots | Select-Object -Unique) -Compress
-"#,
-            &json!({"physical": virtual_disk::physical_path(&path)?}),
+            EJECT_ROOTS,
+            &json!({"physical": virtual_disk::physical_path(&path)?, "expectedVolumes": image.volumes}),
         )?;
         let roots: Vec<String> = serde_json::from_value(roots)?;
+        verify_eject_roots(&roots, &image)?;
         virtual_disk::safe_detach(&path, &roots)
     }
     pub fn relocate(diff: &Path, base: &Path) -> Result<()> {
         let diff = paths::resolve(diff)?;
         let base = paths::resolve(base)?;
+        ensure_finalized(&base)?;
+        ensure_finalized(&diff)?;
         paths::ensure_local(&diff)?;
         if paths::same_path(&diff, &base) {
             bail!("基础镜像与差分不能是同一个文件")
@@ -329,8 +388,73 @@ ConvertTo-Json -InputObject @{uniqueId=[string]$disk.UniqueId} -Compress
     mod tests {
         use super::*;
         #[test]
+        fn partial_mount_and_relocation_are_rejected_before_disk_operations() {
+            for (base, diff) in [
+                ("base.vhdx.partial", "diff.vhdx"),
+                ("base.vhdx", "diff.vhdx.PARTIAL"),
+            ] {
+                let error = mount(MountRequest {
+                    base: base.into(),
+                    diff: diff.into(),
+                    drive_letter: None,
+                })
+                .unwrap_err();
+                assert!(error.to_string().contains(".partial"));
+                let error = relocate(Path::new(diff), Path::new(base)).unwrap_err();
+                assert!(error.to_string().contains(".partial"));
+            }
+        }
+        #[test]
+        fn eject_refuses_missing_or_incomplete_volume_discovery() {
+            // Mock storage queries: test the actual safety script without
+            // opening, attaching, locking, or detaching a real disk.
+            let mock = r#"
+function Get-Disk { [pscustomobject]@{Number=999;IsBoot=$false;IsSystem=$false;PartitionStyle=$req.style} }
+function Get-CimInstance { @() }
+function Get-Partition {
+    if ($req.style -eq 'RAW') { throw 'RAW disks must not enumerate partitions' }
+    foreach ($paths in @($req.partitions)) {
+        [pscustomobject]@{IsBoot=$false;IsSystem=$false;Type='Basic';AccessPaths=@($paths)}
+    }
+}
+"#;
+            let script = format!("{mock}\n{EJECT_ROOTS}");
+            let physical = r"\\.\PhysicalDrive999";
+            assert!(process::powershell(&script, &json!({"physical":physical,"style":"GPT","partitions":[[]],"expectedVolumes":["F:\\"]})).is_err());
+            assert!(process::powershell(&script, &json!({"physical":physical,"style":"GPT","partitions":[["F:\\"],[]],"expectedVolumes":["F:\\"]})).is_err());
+            let valid = process::powershell(&script, &json!({"physical":physical,"style":"GPT","partitions":[["F:\\"]],"expectedVolumes":["F:\\"]})).unwrap();
+            assert_eq!(valid, json!(["F:\\"]));
+            let raw = process::powershell(
+                &script,
+                &json!({"physical":physical,"style":"RAW","partitions":[],"expectedVolumes":[]}),
+            )
+            .unwrap();
+            assert_eq!(raw, json!([]));
+        }
+        #[test]
+        fn mount_result_requires_identified_writable_volume() {
+            let path = Path::new("test-diff.vhdx");
+            assert!(verify_mount_rows(Vec::new(), path).is_err());
+            let row = MountedImage {
+                image_path: path.into(),
+                parent_path: None,
+                volumes: vec!["F:\\".into()],
+                kind: "差分".into(),
+                read_only: false,
+                can_eject: true,
+                warning: None,
+            };
+            assert!(verify_mount_rows(vec![row.clone()], path).is_ok());
+            let mut unreadable = row.clone();
+            unreadable.read_only = true;
+            assert!(verify_mount_rows(vec![unreadable], path).is_err());
+            let mut ambiguous = row;
+            ambiguous.warning = Some("无法验证磁盘状态".into());
+            assert!(verify_mount_rows(vec![ambiguous], path).is_err());
+        }
+        #[test]
         fn powershell_worker_scripts_parse_without_execution() {
-            for script in [DISCOVER, ASSIGN_VOLUMES, INITIALIZE] {
+            for script in [DISCOVER, ASSIGN_VOLUMES, INITIALIZE, EJECT_ROOTS] {
                 process::powershell(r#"
 $tokens = $null; $parseErrors = $null
 [System.Management.Automation.Language.Parser]::ParseInput([string]$req.script, [ref]$tokens, [ref]$parseErrors) | Out-Null

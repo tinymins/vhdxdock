@@ -86,7 +86,7 @@ Get-FileHash -LiteralPath 'D:\Backup\XE-base.vhdx' -Algorithm SHA256
 
 ## 从源码构建
 
-安装 Rust stable 和 Visual Studio C++ Build Tools（MSVC、Windows SDK）：
+安装 Rust stable（最低 1.90）和 Visual Studio C++ Build Tools（MSVC、Windows SDK）：
 
 ```powershell
 git clone https://github.com/tinymins/vhdxdock.git

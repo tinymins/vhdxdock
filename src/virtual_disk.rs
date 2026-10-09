@@ -267,17 +267,34 @@ mod native {
             Ok(PathBuf::from(String::from_utf16_lossy(&chars[..end])))
         }
     }
-    fn physical(handle: &Handle) -> Result<String> {
+    fn physical_optional(handle: &Handle) -> Result<Option<String>> {
         let mut buffer = vec![0u16; 32768];
         let mut len = (buffer.len() * 2) as u32;
-        unsafe {
-            check(
-                GetVirtualDiskPhysicalPath(handle.0, &mut len, PWSTR(buffer.as_mut_ptr())),
-                "查询虚拟磁盘设备",
-            )?;
+        let status =
+            unsafe { GetVirtualDiskPhysicalPath(handle.0, &mut len, PWSTR(buffer.as_mut_ptr())) };
+        // ERROR_DEV_NOT_EXIST is returned for an unattached image (covered by
+        // create-only VHD and VHDX fixtures). Other errors are not proof that
+        // the disk is detached, especially access denial or device failures.
+        if status == windows::Win32::Foundation::ERROR_DEV_NOT_EXIST {
+            return Ok(None);
         }
-        let end = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
-        Ok(String::from_utf16_lossy(&buffer[..end]))
+        check(status, "查询虚拟磁盘设备")?;
+        if len as usize > buffer.len() * 2 {
+            bail!("虚拟磁盘设备响应长度无效")
+        }
+        let end = buffer
+            .iter()
+            .position(|&c| c == 0)
+            .context("虚拟磁盘设备路径未终止")?;
+        if end == 0 {
+            bail!("虚拟磁盘设备路径为空，无法确认挂载状态")
+        }
+        Ok(Some(
+            String::from_utf16(&buffer[..end]).context("虚拟磁盘设备路径编码无效")?,
+        ))
+    }
+    fn physical(handle: &Handle) -> Result<String> {
+        physical_optional(handle)?.context("虚拟磁盘尚未挂载")
     }
     pub fn inspect(path: &Path) -> Result<DiskInfo> {
         let h = open(path, false, true)?;
@@ -302,7 +319,7 @@ mod native {
         } else {
             None
         };
-        let attached = physical(&h).is_ok();
+        let attached = physical_optional(&h)?.is_some();
         Ok(DiskInfo {
             path: path.to_path_buf(),
             format: paths::image_format(path)?,
@@ -353,7 +370,7 @@ mod native {
         Ok(())
     }
     pub fn create_dynamic(path: &Path, bytes: u64) -> Result<()> {
-        if bytes < 16 * 1024 * 1024 || bytes % 512 != 0 {
+        if bytes < 16 * 1024 * 1024 || !bytes.is_multiple_of(512) {
             bail!("虚拟容量必须至少 16 MiB，且为 512 字节的倍数")
         }
         create(path, bytes, None)
@@ -512,7 +529,8 @@ mod native {
             check(
                 GetStorageDependencyInformation(
                     h.0,
-                    GET_STORAGE_DEPENDENCY_FLAG_DISK_HANDLE,
+                    GET_STORAGE_DEPENDENCY_FLAG_DISK_HANDLE
+                        | GET_STORAGE_DEPENDENCY_FLAG_HOST_VOLUMES,
                     (buffer.len() * 8) as u32,
                     ptr,
                     None,
@@ -547,7 +565,7 @@ mod native {
                     let addr = p.0 as usize;
                     let start = buffer.as_ptr() as usize;
                     let end = start + buffer.len() * 8;
-                    if addr < start || addr >= end || addr % 2 != 0 {
+                    if addr < start || addr >= end || !addr.is_multiple_of(2) {
                         bail!("依赖路径指针无效")
                     }
                     let chars = std::slice::from_raw_parts(p.0, (end - addr) / 2);
@@ -615,6 +633,9 @@ mod native {
                 let relocated = temp.path().join(format!("moved.{ext}"));
                 let unrelated = temp.path().join(format!("unrelated.{ext}"));
                 create_dynamic(&base, 64 * 1024 * 1024).unwrap();
+                assert!(physical_optional(&open(&base, false, true).unwrap())
+                    .unwrap()
+                    .is_none());
                 if ext == "vhdx" {
                     // The VHDX linkage is its active header DataWriteGuid,
                     // not the persistent guest-visible VirtualDiskId.

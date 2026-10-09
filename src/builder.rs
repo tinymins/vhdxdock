@@ -37,9 +37,27 @@ struct Manifest {
     bytes: u64,
 }
 
+#[derive(Debug)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("操作已取消；未完成镜像和日志已保留")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+/// Only a bare cancellation permits the UI to close automatically. Context
+/// around it can describe a cleanup failure and must remain visible.
+pub fn is_clean_cancellation(error: &anyhow::Error) -> bool {
+    let outer: &(dyn std::error::Error + 'static) = error.as_ref();
+    outer.is::<Cancelled>()
+}
+
 fn check_cancel(cancel: &AtomicBool) -> Result<()> {
     if cancel.load(Ordering::Relaxed) {
-        bail!("操作已取消；未完成镜像和日志已保留");
+        return Err(Cancelled.into());
     }
     Ok(())
 }
@@ -317,6 +335,36 @@ fn available_bytes(directory: &Path) -> Result<u64> {
 }
 
 #[cfg(windows)]
+fn robocopy_path(path: &Path) -> PathBuf {
+    use std::{
+        ffi::OsString,
+        os::windows::ffi::{OsStrExt, OsStringExt},
+    };
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let prefix: Vec<u16> = r"\\?\".encode_utf16().collect();
+    if wide.starts_with(&prefix) {
+        if wide.len() >= 8
+            && wide[4..8]
+                .iter()
+                .zip("UNC\\".encode_utf16())
+                .all(|(a, b)| *a <= 0x7f && (*a as u8).to_ascii_uppercase() == b as u8)
+        {
+            let mut normal: Vec<u16> = r"\\".encode_utf16().collect();
+            normal.extend_from_slice(&wide[8..]);
+            return PathBuf::from(OsString::from_wide(&normal));
+        }
+        if wide.len() >= 6
+            && wide[4] <= 0x7f
+            && (wide[4] as u8).is_ascii_alphabetic()
+            && wide[5] == b':' as u16
+        {
+            return PathBuf::from(OsString::from_wide(&wide[4..]));
+        }
+    }
+    path.to_owned()
+}
+
+#[cfg(windows)]
 struct RobocopyWorker {
     child: std::process::Child,
     finished: bool,
@@ -356,18 +404,22 @@ fn run_robocopy(
         thread,
     };
     let mut cmd = Command::new("robocopy.exe");
-    cmd.arg(source).arg(target).args([
-        "/E",
-        "/COPY:DAT",
-        "/DCOPY:DAT",
-        "/SL",
-        "/SJ",
-        "/R:2",
-        "/W:2",
-        "/NP",
-        "/NFL",
-        "/NDL",
-    ]);
+    // Robocopy handles long paths itself but rejects explicit extended-length
+    // directory prefixes (ERROR 123). canonicalize() adds those on Windows.
+    cmd.arg(robocopy_path(source))
+        .arg(robocopy_path(target))
+        .args([
+            "/E",
+            "/COPY:DAT",
+            "/DCOPY:DAT",
+            "/SL",
+            "/SJ",
+            "/R:2",
+            "/W:2",
+            "/NP",
+            "/NFL",
+            "/NDL",
+        ]);
     if verify {
         cmd.args(["/L", "/XX", "/R:0", "/W:0"]);
     } else {
@@ -719,6 +771,74 @@ fn build_windows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancellation_is_clean_only_without_cleanup_context() {
+        let cancelled = check_cancel(&AtomicBool::new(true)).unwrap_err();
+        assert!(is_clean_cancellation(&cancelled));
+        assert!(!is_clean_cancellation(
+            &cancelled.context("清理时无法卸载镜像")
+        ));
+        assert!(!is_clean_cancellation(&anyhow::anyhow!("操作失败")));
+    }
+    #[cfg(windows)]
+    #[test]
+    fn robocopy_converts_extended_directory_paths() {
+        assert_eq!(
+            robocopy_path(Path::new(r"\\?\D:\资料 ' $\source")),
+            PathBuf::from(r"D:\资料 ' $\source")
+        );
+        assert_eq!(
+            robocopy_path(Path::new(r"\\?\UNC\NAS\共享\source")),
+            PathBuf::from(r"\\NAS\共享\source")
+        );
+        assert_eq!(
+            robocopy_path(Path::new(r"\\?\unc\NAS\共享\source")),
+            PathBuf::from(r"\\NAS\共享\source")
+        );
+        assert_eq!(
+            robocopy_path(Path::new(r"\\NAS\共享\source")),
+            PathBuf::from(r"\\NAS\共享\source")
+        );
+    }
+    #[cfg(windows)]
+    #[test]
+    fn robocopy_canonical_unicode_directory_regression_without_admin() {
+        let scratch = tempfile::tempdir().unwrap();
+        let source = scratch.path().join("源文件夹 ' $ 中文");
+        let target = scratch.path().join("目标文件夹 ' $ 中文");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(source.join("说明 ' $ 内容.txt"), b"literal fixture").unwrap();
+        let source = fs::canonicalize(source).unwrap();
+        let target = fs::canonicalize(target).unwrap();
+        let log_root = fs::canonicalize(scratch.path()).unwrap();
+        let cancel = AtomicBool::new(false);
+        let manifest = scan(&source, &cancel, &|_| {}, "scan", &[]).unwrap();
+        run_robocopy(
+            &source,
+            &target,
+            &log_root.join("copy.log"),
+            false,
+            &cancel,
+            &|_| {},
+            &manifest,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(target.join("说明 ' $ 内容.txt")).unwrap(),
+            b"literal fixture"
+        );
+        run_robocopy(
+            &source,
+            &target,
+            &log_root.join("verify.log"),
+            true,
+            &cancel,
+            &|_| {},
+            &manifest,
+        )
+        .unwrap();
+    }
     #[test]
     fn capacity_accounts_for_overhead_and_overflow() {
         assert!(capacity_bytes(0, 0, 0).is_err());

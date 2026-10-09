@@ -15,17 +15,31 @@ $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer
 if (Test-Path -LiteralPath $vswhere) {
     $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
     if ($vs) {
-        Import-Module (Join-Path $vs 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
-        Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64' | Out-Null
+        # The VS bootstrap invokes cmd.exe, whose cwd cannot be a WSL/UNC path.
+        Push-Location -LiteralPath $vs
+        try {
+            Import-Module (Join-Path $vs 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
+            Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64' | Out-Null
+        } finally {
+            Pop-Location
+        }
     }
 }
 
 $env:RUSTC_WRAPPER = ''
-$cargoArgs = @($Action, '--locked')
+$cargoOverride = Join-Path ([IO.Path]::GetTempPath()) ('vhdxdock-cargo-' + [Guid]::NewGuid().ToString('N') + '.toml')
+# Windows PowerShell 5.1 removes empty environment variables. An explicit
+# config file also overrides a rustc-wrapper inherited from global Cargo config.
+[IO.File]::WriteAllText($cargoOverride, "[build]`nrustc-wrapper = `"`"`n")
+$cargoArgs = @($Action, '--config', $cargoOverride, '--locked')
 if ($Release) { $cargoArgs += '--release' }
 if ($Action -eq 'clippy') { $cargoArgs += @('--all-targets', '--', '-D', 'warnings') }
-& cargo @cargoArgs
-if ($LASTEXITCODE -ne 0) { throw "cargo $Action failed ($LASTEXITCODE)" }
+try {
+    & cargo @cargoArgs
+    if ($LASTEXITCODE -ne 0) { throw "cargo $Action failed ($LASTEXITCODE)" }
+} finally {
+    Remove-Item -LiteralPath $cargoOverride -ErrorAction SilentlyContinue
+}
 
 if ($Action -eq 'build') {
     $profile = if ($Release) { 'release' } else { 'debug' }
