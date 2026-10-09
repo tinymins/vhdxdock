@@ -145,6 +145,80 @@ fn mounted_volume(rows: &[MountedImage], diff: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(root))
 }
 
+fn diagnose_scratch_mount(scratch_root: &Path, diff: &Path) {
+    if !diff.starts_with(scratch_root) {
+        eprintln!("Refusing diagnostics for image outside this test's scratch directory");
+        return;
+    }
+    eprintln!("Scratch mount failure image: {}", diff.display());
+    match virtual_disk::inspect(diff) {
+        Ok(info) => eprintln!("Scratch native image state: {info:?}"),
+        Err(error) => eprintln!("Scratch native image query failed: {error:#}"),
+    }
+    let physical = match virtual_disk::physical_path(diff) {
+        Ok(physical) => physical,
+        Err(error) => {
+            eprintln!("Scratch image physical-device query failed: {error:#}");
+            return;
+        }
+    };
+    // Diagnostic queries are restricted to the native physical-device mapping
+    // of this test's own diff. This script makes no storage state changes.
+    let diagnostic = process::powershell(
+        r#"
+if ([string]$req.physical -notmatch '^\\\\\.\\PhysicalDrive(\d+)$') { throw 'Invalid scratch physical-device path' }
+$number = [int]$Matches[1]
+$disk = Get-Disk -Number $number -ErrorAction Stop
+$rows = @()
+$partitionError = $null
+try {
+    foreach ($partition in @(Get-Partition -DiskNumber $number -ErrorAction Stop)) {
+        $volumes = @()
+        $volumeError = $null
+        try {
+            $volumes = @($partition | Get-Volume -ErrorAction Stop | Select-Object DriveLetter, Path, UniqueId, FileSystem, FileSystemType, FileSystemLabel, HealthStatus, OperationalStatus, Size, SizeRemaining)
+        } catch { $volumeError = $_.Exception.Message }
+        $rows += [pscustomobject]@{
+            partition = ($partition | Select-Object DiskNumber, PartitionNumber, DriveLetter, AccessPaths, Type, GptType, Guid, Offset, Size, IsBoot, IsSystem, IsHidden, IsReadOnly, NoDefaultDriveLetter)
+            volumes = @($volumes)
+            volume_error = $volumeError
+        }
+    }
+} catch { $partitionError = $_.Exception.Message }
+ConvertTo-Json -InputObject @{
+    image = [string]$req.image
+    physical = [string]$req.physical
+    disk = ($disk | Select-Object Number, FriendlyName, UniqueId, Path, Location, BusType, PartitionStyle, Size, IsOffline, IsReadOnly, IsBoot, IsSystem, OperationalStatus, HealthStatus)
+    partitions = @($rows)
+    partition_error = $partitionError
+} -Depth 8 -Compress
+"#,
+        &json!({"physical": physical, "image": diff}),
+    );
+    match diagnostic {
+        Ok(value) => eprintln!(
+            "Scratch Get-Disk/Get-Partition/Get-Volume diagnostics:\n{}",
+            serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+        ),
+        Err(error) => eprintln!("Scratch storage diagnostics failed: {error:#}"),
+    }
+}
+
+fn mount_scratch(
+    request: MountRequest,
+    scratch_root: &Path,
+    context: &str,
+) -> Result<Vec<MountedImage>> {
+    let diff = request.diff.clone();
+    match backend::mount(request) {
+        Ok(rows) => Ok(rows),
+        Err(error) => {
+            diagnose_scratch_mount(scratch_root, &diff);
+            Err(error).context(context.to_owned())
+        }
+    }
+}
+
 fn scenario(verify: VerifyMode, compress: bool) -> Result<()> {
     require_explicit_permission_and_admin()?;
     let _serial = BUILDER_TEST_LOCK
@@ -252,8 +326,11 @@ ConvertTo-Json -InputObject @{ok=$true} -Compress
         diff: diff.clone(),
         drive_letter: None,
     };
-    let rows =
-        backend::mount(request()).context("creating/mounting scratch differencing disk failed")?;
+    let rows = mount_scratch(
+        request(),
+        scratch.root(),
+        "creating/mounting scratch differencing disk failed",
+    )?;
     let root = mounted_volume(&rows, &diff)?;
     ensure!(
         fs::read(root.join(chinese_file))? == contents,
@@ -285,8 +362,11 @@ ConvertTo-Json -InputObject @{ok=$true} -Compress
         sha256(&base)? == initial_hash,
         "base changed after differential writes"
     );
-    let rows =
-        backend::mount(request()).context("remount of existing scratch difference failed")?;
+    let rows = mount_scratch(
+        request(),
+        scratch.root(),
+        "remount of existing scratch difference failed",
+    )?;
     let root = mounted_volume(&rows, &diff)?;
     ensure!(
         fs::read(root.join("overlay-only ' $ 中文.txt"))? == b"persisted in difference only",

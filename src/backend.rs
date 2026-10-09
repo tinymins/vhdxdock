@@ -58,8 +58,14 @@ foreach ($candidate in @($req.candidates)) {
         if ($disk.PartitionStyle -ne 'RAW') { $partitions = @(Get-Partition -DiskNumber $disk.Number -ErrorAction Stop) }
         foreach ($partition in $partitions) {
             if ($partition.IsBoot -or $partition.IsSystem) { $protected = $true }
-            foreach ($access in @($partition.AccessPaths)) {
-                if ($access -and $access -notlike '\\?\Volume{*') {
+            $openPaths = @($partition.AccessPaths)
+            # AccessPaths can lag behind DriveLetter after Add-PartitionAccessPath.
+            # A cached letter is accepted only when the root is actually accessible.
+            if ($partition.DriveLetter -and ([string]$partition.DriveLetter) -match '^[A-Za-z]$') {
+                $openPaths += ([string]$partition.DriveLetter + ':\')
+            }
+            foreach ($access in $openPaths) {
+                if ($access -and $access -notlike '\\?\Volume{*' -and (Test-Path -LiteralPath ([string]$access) -PathType Container)) {
                     $volumes += [string]$access
                     if ($pageRoots -contains [string]$access) { $protected = $true }
                 }
@@ -148,7 +154,23 @@ foreach ($p in $eligible) {
     }
     $first = $false
 }
-ConvertTo-Json -InputObject @{ok=$true} -Compress
+ConvertTo-Json -InputObject @{ok=$true;partitions=@(Get-Partition -DiskNumber $disk.Number -ErrorAction Stop | Select-Object PartitionNumber,DriveLetter,AccessPaths)} -Depth 5 -Compress
+"#;
+
+    const MOUNT_DIAGNOSTICS: &str = r#"
+$snapshot = @{physical=[string]$req.physical;disk=$null;partitions=@();error=$null}
+try {
+    if ([string]$req.physical -notmatch '^\\\\\.\\PhysicalDrive(\d+)$') { throw '设备路径无效' }
+    $disk = Get-Disk -Number ([int]$Matches[1]) -ErrorAction Stop
+    $snapshot.disk = $disk | Select-Object Number,UniqueId,PartitionStyle,IsOffline,IsReadOnly,BusType,Size
+    foreach ($p in @(Get-Partition -DiskNumber $disk.Number -ErrorAction Stop)) {
+        $row = @{partitionNumber=$p.PartitionNumber;driveLetter=[string]$p.DriveLetter;letterCode=[int][char]$p.DriveLetter;accessPaths=@($p.AccessPaths);volume=$null;volumeError=$null;rootAccessible=$false}
+        if ($p.DriveLetter) { $row.rootAccessible = Test-Path -LiteralPath ([string]$p.DriveLetter + ':\') -PathType Container }
+        try { $row.volume = $p | Get-Volume -ErrorAction Stop | Select-Object DriveLetter,Path,UniqueId,FileSystemType,HealthStatus,OperationalStatus } catch { $row.volumeError = $_.Exception.Message }
+        $snapshot.partitions += $row
+    }
+} catch { $snapshot.error=$_.Exception.Message }
+ConvertTo-Json -InputObject $snapshot -Depth 7 -Compress
 "#;
 
     pub fn mount(request: MountRequest) -> Result<Vec<MountedImage>> {
@@ -206,25 +228,45 @@ ConvertTo-Json -InputObject @{ok=$true} -Compress
             )
         }
         if child.attached {
-            return verify_mount_rows(mounted, &diff);
+            return wait_for_mount_rows(&diff);
         }
         virtual_disk::attach(&diff)?;
-        let assigned = (|| -> Result<()> {
+        let assigned = (|| -> Result<serde_json::Value> {
             let physical = virtual_disk::physical_path(&diff)?;
             process::powershell(
                 ASSIGN_VOLUMES,
                 &json!({"physical": physical, "letter": request.drive_letter.map(|c| c.to_ascii_uppercase().to_string())}),
-            )?;
-            Ok(())
+            )
         })();
-        if let Err(error) = assigned {
-            if let Err(detach_error) = virtual_disk::detach(&diff) {
-                bail!("{error:#}；挂载回滚失败，请刷新并手动卸载：{detach_error:#}")
+        let assignment = match assigned {
+            Ok(value) => value,
+            Err(error) => {
+                if let Err(detach_error) = virtual_disk::detach(&diff) {
+                    bail!("{error:#}；挂载回滚失败，请刷新并手动卸载：{detach_error:#}")
+                }
+                return Err(error);
             }
-            return Err(error);
+        };
+        wait_for_mount_rows(&diff).with_context(|| format!("镜像已连接，但挂载状态未通过检查；请刷新查看实际状态。分配盘符后的快照：{assignment}"))
+    }
+    fn wait_for_mount_rows(diff: &Path) -> Result<Vec<MountedImage>> {
+        let mut last = anyhow::anyhow!("Windows 尚未返回挂载状态");
+        for attempt in 0..8 {
+            match list_mounted().and_then(|rows| verify_mount_rows(rows, diff)) {
+                Ok(rows) => return Ok(rows),
+                Err(error) => last = error,
+            }
+            if attempt < 7 {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
         }
-        verify_mount_rows(list_mounted()?, &diff)
-            .context("镜像已连接，但挂载状态未通过检查；请刷新查看实际状态")
+        let diagnostic = virtual_disk::physical_path(diff)
+            .and_then(|physical| {
+                process::powershell(MOUNT_DIAGNOSTICS, &json!({"physical":physical}))
+            })
+            .unwrap_or_else(|error| json!({"diagnosticError":format!("{error:#}")}));
+        Err(last)
+            .with_context(|| format!("等待卷就绪后仍未通过挂载检查；实时存储快照：{diagnostic}"))
     }
     fn ensure_finalized(path: &Path) -> Result<()> {
         if path
@@ -267,6 +309,10 @@ foreach ($partition in $partitions) {
     # AccessPaths contains GUID roots as well as letters and mounted folders.
     # Get-Volume errors must never silently remove a volume from the lock set.
     $accessPaths = @($partition.AccessPaths | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if ($partition.DriveLetter -and ([string]$partition.DriveLetter) -match '^[A-Za-z]$') {
+        $letterRoot = [string]$partition.DriveLetter + ':\'
+        if (Test-Path -LiteralPath $letterRoot -PathType Container) { $accessPaths += $letterRoot }
+    }
     if ($accessPaths.Count -eq 0 -and [string]$partition.Type -ne 'Reserved') { throw '无法确认分区卷路径，拒绝卸载' }
     foreach ($access in $accessPaths) {
         if (-not ([string]$access).EndsWith('\')) { throw '卷路径未以反斜杠结束，拒绝卸载' }
@@ -388,6 +434,26 @@ ConvertTo-Json -InputObject @{uniqueId=[string]$disk.UniqueId} -Compress
     mod tests {
         use super::*;
         #[test]
+        fn discovery_letter_fallback_requires_an_accessible_root() {
+            let mock = r#"
+function Get-CimInstance { @() }
+function Get-Disk { [pscustomobject]@{Number=999;IsBoot=$false;IsSystem=$false;IsReadOnly=$false;PartitionStyle='GPT'} }
+function Get-DiskImage { [pscustomobject]@{ImagePath='test-diff.vhdx'} }
+function Get-Partition { [pscustomobject]@{PartitionNumber=2;DriveLetter=[char]'F';AccessPaths=@('\\?\Volume{fixture}\');IsBoot=$false;IsSystem=$false} }
+function Test-Path {
+    param($LiteralPath,$PathType)
+    if ($PathType -ne 'Container' -or $LiteralPath -ne 'F:\') { throw 'root accessibility check was bypassed or malformed' }
+    [bool]$req.accessible
+}
+"#;
+            let script = format!("{mock}\n{DISCOVER}");
+            let request = |accessible| json!({"accessible":accessible,"candidates":[{"physical":r"\\.\PhysicalDrive999","image":"test-diff.vhdx"}]});
+            let ready = process::powershell(&script, &request(true)).unwrap();
+            assert_eq!(ready[0]["volumes"], json!(["F:\\"]));
+            let unavailable = process::powershell(&script, &request(false)).unwrap();
+            assert_eq!(unavailable[0]["volumes"], json!([]));
+        }
+        #[test]
         fn partial_mount_and_relocation_are_rejected_before_disk_operations() {
             for (base, diff) in [
                 ("base.vhdx.partial", "diff.vhdx"),
@@ -454,7 +520,13 @@ function Get-Partition {
         }
         #[test]
         fn powershell_worker_scripts_parse_without_execution() {
-            for script in [DISCOVER, ASSIGN_VOLUMES, INITIALIZE, EJECT_ROOTS] {
+            for script in [
+                DISCOVER,
+                ASSIGN_VOLUMES,
+                INITIALIZE,
+                EJECT_ROOTS,
+                MOUNT_DIAGNOSTICS,
+            ] {
                 process::powershell(r#"
 $tokens = $null; $parseErrors = $null
 [System.Management.Automation.Language.Parser]::ParseInput([string]$req.script, [ref]$tokens, [ref]$parseErrors) | Out-Null

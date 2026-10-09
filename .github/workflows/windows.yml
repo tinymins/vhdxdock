@@ -23,7 +23,12 @@ jobs:
         shell: pwsh
         env:
           VHDXDOCK_RUN_DISK_TESTS: '1'
-        run: cargo test --locked --test windows_disks --test windows_builder -- --ignored --test-threads=1
+        run: |
+          cargo test --locked --test windows_disks -- --ignored --test-threads=1
+          $disksExit = $LASTEXITCODE
+          cargo test --locked --test windows_builder -- --ignored --test-threads=1
+          $builderExit = $LASTEXITCODE
+          if ($disksExit -ne 0 -or $builderExit -ne 0) { throw "Disk tests: $disksExit; builder tests: $builderExit" }
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
