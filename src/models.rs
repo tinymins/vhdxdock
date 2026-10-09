@@ -2,10 +2,18 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ImageFormat { Vhd, Vhdx }
+pub enum ImageFormat {
+    Vhd,
+    Vhdx,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DiskKind { Fixed, Dynamic, Differencing, Unknown }
+pub enum DiskKind {
+    Fixed,
+    Dynamic,
+    Differencing,
+    Unknown,
+}
 
 #[derive(Debug, Clone)]
 pub struct DiskInfo {
@@ -36,7 +44,11 @@ pub struct MountedImage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum VerifyMode { #[default] Metadata, Sha256 }
+pub enum VerifyMode {
+    #[default]
+    Metadata,
+    Sha256,
+}
 
 #[derive(Debug, Clone)]
 pub struct BuildRequest {
@@ -65,4 +77,3 @@ pub struct Progress {
     pub total_files: u64,
     pub total_bytes: u64,
 }
-

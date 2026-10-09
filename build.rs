@@ -3,8 +3,12 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let mut res = winresource::WindowsResource::new();
         res.set("ProductName", "VhdxDock");
-        res.set("FileDescription", "VhdxDock — VHDX image builder and differencing disk manager");
+        res.set(
+            "FileDescription",
+            "VhdxDock — VHDX image builder and differencing disk manager",
+        );
         res.set_manifest_file("assets/app.manifest");
-        res.compile().expect("compile Windows application resources");
+        res.compile()
+            .expect("compile Windows application resources");
     }
 }

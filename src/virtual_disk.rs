@@ -1,0 +1,687 @@
+//! Native virtual-disk operations. Parent stores are never opened read/write.
+use crate::models::DiskInfo;
+use anyhow::Result;
+use std::path::Path;
+
+#[cfg(windows)]
+pub use native::*;
+
+#[cfg(not(windows))]
+fn unsupported<T>() -> Result<T> {
+    anyhow::bail!("此功能仅支持 Windows")
+}
+#[cfg(not(windows))]
+pub fn inspect(_: &Path) -> Result<DiskInfo> {
+    unsupported()
+}
+#[cfg(not(windows))]
+pub fn create_dynamic(_: &Path, _: u64) -> Result<()> {
+    unsupported()
+}
+#[cfg(not(windows))]
+pub fn create_difference(_: &Path, _: &Path) -> Result<()> {
+    unsupported()
+}
+#[cfg(not(windows))]
+pub fn attach(_: &Path) -> Result<()> {
+    unsupported()
+}
+#[cfg(not(windows))]
+pub fn detach(_: &Path) -> Result<()> {
+    unsupported()
+}
+#[cfg(not(windows))]
+pub fn physical_path(_: &Path) -> Result<String> {
+    unsupported()
+}
+#[cfg(not(windows))]
+pub fn relocate_parent(_: &Path, _: &Path) -> Result<()> {
+    unsupported()
+}
+#[cfg(not(windows))]
+pub fn validate_parent(_: &Path, _: &Path) -> Result<()> {
+    unsupported()
+}
+
+#[derive(Debug)]
+pub struct AttachedPath {
+    pub physical: String,
+    pub image: Option<std::path::PathBuf>,
+}
+#[cfg(not(windows))]
+pub fn attached_paths() -> Result<Vec<AttachedPath>> {
+    unsupported()
+}
+
+#[cfg(windows)]
+mod native {
+    use super::*;
+    use crate::{
+        models::{DiskKind, ImageFormat},
+        paths,
+    };
+    use anyhow::{bail, Context};
+    use std::{
+        mem::{offset_of, size_of},
+        os::windows::ffi::OsStrExt,
+        path::PathBuf,
+    };
+    use windows::{
+        core::{BOOL, PCWSTR, PWSTR},
+        Win32::{
+            Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, WIN32_ERROR},
+            Storage::{
+                FileSystem::{
+                    CreateFileW, GetVolumeNameForVolumeMountPointW, FILE_ATTRIBUTE_NORMAL,
+                    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+                },
+                Vhd::*,
+            },
+            System::{Ioctl::FSCTL_LOCK_VOLUME, IO::DeviceIoControl},
+        },
+    };
+
+    struct Handle(HANDLE);
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+    /// Elevation alone does not enable SeManageVolumePrivilege. Serialize the
+    /// temporary process-token adjustment and restore the previous token state.
+    struct ManageVolumePrivilege {
+        token: Handle,
+        previous: windows::Win32::Security::TOKEN_PRIVILEGES,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    static PRIVILEGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    impl ManageVolumePrivilege {
+        fn enable() -> Result<Self> {
+            use windows::Win32::{
+                Foundation::{GetLastError, ERROR_NOT_ALL_ASSIGNED, LUID},
+                Security::*,
+                System::Threading::{GetCurrentProcess, OpenProcessToken},
+            };
+            let lock = PRIVILEGE_LOCK
+                .lock()
+                .map_err(|_| anyhow::anyhow!("权限操作锁异常"))?;
+            let mut raw = HANDLE::default();
+            unsafe {
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                    &mut raw,
+                )?;
+            }
+            let token = Handle(raw);
+            let mut luid = LUID::default();
+            unsafe {
+                LookupPrivilegeValueW(PCWSTR::null(), SE_MANAGE_VOLUME_NAME, &mut luid)?;
+            }
+            let new = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [LUID_AND_ATTRIBUTES {
+                    Luid: luid,
+                    Attributes: SE_PRIVILEGE_ENABLED,
+                }],
+            };
+            let mut previous = TOKEN_PRIVILEGES::default();
+            let mut len = 0;
+            unsafe {
+                AdjustTokenPrivileges(
+                    token.0,
+                    false,
+                    Some(&new),
+                    size_of::<TOKEN_PRIVILEGES>() as u32,
+                    Some(&mut previous),
+                    Some(&mut len),
+                )?;
+                if GetLastError() == ERROR_NOT_ALL_ASSIGNED {
+                    bail!("当前进程缺少磁盘管理权限，请以管理员身份运行 VhdxDock")
+                }
+            }
+            Ok(Self {
+                token,
+                previous,
+                _lock: lock,
+            })
+        }
+    }
+    impl Drop for ManageVolumePrivilege {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = windows::Win32::Security::AdjustTokenPrivileges(
+                    self.token.0,
+                    false,
+                    Some(&self.previous),
+                    0,
+                    None,
+                    None,
+                );
+            }
+        }
+    }
+    fn check(code: WIN32_ERROR, action: &str) -> Result<()> {
+        if code.0 == 0 {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "{action}: {} (Win32 {})",
+                std::io::Error::from_raw_os_error(code.0 as i32),
+                code.0
+            ))
+        }
+    }
+    fn wide(path: &Path) -> Result<Vec<u16>> {
+        let mut v: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if v.contains(&0) {
+            bail!("路径含有空字符")
+        }
+        v.push(0);
+        Ok(v)
+    }
+    fn storage(format: ImageFormat) -> VIRTUAL_STORAGE_TYPE {
+        VIRTUAL_STORAGE_TYPE {
+            DeviceId: match format {
+                ImageFormat::Vhd => VIRTUAL_STORAGE_TYPE_DEVICE_VHD,
+                ImageFormat::Vhdx => VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
+            },
+            VendorId: VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT,
+        }
+    }
+    fn open(path: &Path, writable: bool, no_parents: bool) -> Result<Handle> {
+        let p = wide(path)?;
+        let params = OPEN_VIRTUAL_DISK_PARAMETERS {
+            Version: OPEN_VIRTUAL_DISK_VERSION_2,
+            Anonymous: OPEN_VIRTUAL_DISK_PARAMETERS_0 {
+                Version2: OPEN_VIRTUAL_DISK_PARAMETERS_0_1 {
+                    GetInfoOnly: BOOL(0),
+                    ReadOnly: BOOL(i32::from(!writable)),
+                    ..Default::default()
+                },
+            },
+        };
+        let mut handle = HANDLE::default();
+        unsafe {
+            check(
+                OpenVirtualDisk(
+                    &storage(paths::image_format(path)?),
+                    PCWSTR(p.as_ptr()),
+                    VIRTUAL_DISK_ACCESS_NONE,
+                    if no_parents {
+                        OPEN_VIRTUAL_DISK_FLAG_NO_PARENTS
+                    } else {
+                        OPEN_VIRTUAL_DISK_FLAG_NONE
+                    },
+                    Some(&params),
+                    &mut handle,
+                ),
+                "打开虚拟磁盘",
+            )?;
+        }
+        Ok(Handle(handle))
+    }
+    fn info(
+        handle: &Handle,
+        version: GET_VIRTUAL_DISK_INFO_VERSION,
+    ) -> Result<GET_VIRTUAL_DISK_INFO> {
+        let mut value = GET_VIRTUAL_DISK_INFO {
+            Version: version,
+            ..Default::default()
+        };
+        let mut len = size_of::<GET_VIRTUAL_DISK_INFO>() as u32;
+        unsafe {
+            check(
+                GetVirtualDiskInformation(handle.0, &mut len, &mut value, None),
+                "查询虚拟磁盘信息",
+            )?;
+        }
+        Ok(value)
+    }
+    fn parent_path(handle: &Handle) -> Result<PathBuf> {
+        // u64 storage provides the required structure alignment; the trailing WCHAR array is variable length.
+        let mut buffer = vec![0u64; 32768];
+        let ptr = buffer.as_mut_ptr().cast::<GET_VIRTUAL_DISK_INFO>();
+        let mut len = (buffer.len() * 8) as u32;
+        unsafe {
+            (*ptr).Version = GET_VIRTUAL_DISK_INFO_PARENT_LOCATION;
+            check(
+                GetVirtualDiskInformation(handle.0, &mut len, ptr, None),
+                "查询父镜像路径",
+            )?;
+            if len as usize > buffer.len() * 8 {
+                bail!("父镜像路径响应长度无效")
+            }
+            let start = std::ptr::addr_of!((*ptr).Anonymous.ParentLocation.ParentLocationBuffer)
+                .cast::<u16>();
+            let offset = start as usize - buffer.as_ptr() as usize;
+            let chars =
+                std::slice::from_raw_parts(start, (len as usize).saturating_sub(offset) / 2);
+            let end = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
+            if end == 0 {
+                bail!("差分盘未提供父镜像路径")
+            }
+            // With unresolved parents Windows returns a MULTI_SZ; its first entry is sufficient for diagnostics.
+            Ok(PathBuf::from(String::from_utf16_lossy(&chars[..end])))
+        }
+    }
+    fn physical(handle: &Handle) -> Result<String> {
+        let mut buffer = vec![0u16; 32768];
+        let mut len = (buffer.len() * 2) as u32;
+        unsafe {
+            check(
+                GetVirtualDiskPhysicalPath(handle.0, &mut len, PWSTR(buffer.as_mut_ptr())),
+                "查询虚拟磁盘设备",
+            )?;
+        }
+        let end = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+        Ok(String::from_utf16_lossy(&buffer[..end]))
+    }
+    pub fn inspect(path: &Path) -> Result<DiskInfo> {
+        let h = open(path, false, true)?;
+        let kind = match unsafe {
+            info(&h, GET_VIRTUAL_DISK_INFO_PROVIDER_SUBTYPE)?
+                .Anonymous
+                .ProviderSubtype
+        } {
+            2 => DiskKind::Fixed,
+            3 => DiskKind::Dynamic,
+            4 => DiskKind::Differencing,
+            _ => DiskKind::Unknown,
+        };
+        let virtual_size = unsafe {
+            info(&h, GET_VIRTUAL_DISK_INFO_SIZE)?
+                .Anonymous
+                .Size
+                .VirtualSize
+        };
+        let parent = if kind == DiskKind::Differencing {
+            Some(parent_path(&h)?)
+        } else {
+            None
+        };
+        let attached = physical(&h).is_ok();
+        Ok(DiskInfo {
+            path: path.to_path_buf(),
+            format: paths::image_format(path)?,
+            kind,
+            parent,
+            virtual_size,
+            attached,
+        })
+    }
+    fn create(path: &Path, size: u64, parent: Option<&Path>) -> Result<()> {
+        if path.exists() {
+            bail!("目标镜像已存在：{}", path.display())
+        }
+        let format = paths::image_format(path)?;
+        let p = wide(path)?;
+        let parent_wide = parent.map(wide).transpose()?;
+        let params = CREATE_VIRTUAL_DISK_PARAMETERS {
+            Version: CREATE_VIRTUAL_DISK_VERSION_2,
+            Anonymous: CREATE_VIRTUAL_DISK_PARAMETERS_0 {
+                Version2: CREATE_VIRTUAL_DISK_PARAMETERS_0_1 {
+                    MaximumSize: size,
+                    ParentPath: parent_wide
+                        .as_ref()
+                        .map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr())),
+                    ParentVirtualStorageType: parent.map(|_| storage(format)).unwrap_or_default(),
+                    ..Default::default()
+                },
+            },
+        };
+        let mut h = HANDLE::default();
+        unsafe {
+            check(
+                CreateVirtualDisk(
+                    &storage(format),
+                    PCWSTR(p.as_ptr()),
+                    VIRTUAL_DISK_ACCESS_NONE,
+                    None,
+                    CREATE_VIRTUAL_DISK_FLAG_NONE,
+                    0,
+                    &params,
+                    None,
+                    &mut h,
+                ),
+                "创建虚拟磁盘",
+            )?;
+        }
+        drop(Handle(h));
+        Ok(())
+    }
+    pub fn create_dynamic(path: &Path, bytes: u64) -> Result<()> {
+        if bytes < 16 * 1024 * 1024 || bytes % 512 != 0 {
+            bail!("虚拟容量必须至少 16 MiB，且为 512 字节的倍数")
+        }
+        create(path, bytes, None)
+    }
+    pub fn create_difference(base: &Path, diff: &Path) -> Result<()> {
+        if paths::image_format(base)? != paths::image_format(diff)? {
+            bail!("基础镜像与差分格式必须一致")
+        }
+        if paths::same_path(base, diff) {
+            bail!("基础镜像和差分不能是同一个文件")
+        }
+        // CreateVirtualDisk opens the parent as backing storage. No metadata or merge flags are enabled.
+        create(diff, 0, Some(base))?;
+        validate_parent(diff, base)
+    }
+    pub fn validate_parent(diff: &Path, base: &Path) -> Result<()> {
+        let child = open(diff, false, true)?;
+        let parent = open(base, false, true)?;
+        let expected = unsafe {
+            info(&child, GET_VIRTUAL_DISK_INFO_PARENT_IDENTIFIER)?
+                .Anonymous
+                .ParentIdentifier
+        };
+        let actual = unsafe {
+            info(&parent, GET_VIRTUAL_DISK_INFO_IDENTIFIER)?
+                .Anonymous
+                .Identifier
+        };
+        if expected != actual {
+            bail!("父镜像身份不匹配；基础镜像可能不是原始副本，或已被修改")
+        }
+        Ok(())
+    }
+    pub fn attach(path: &Path) -> Result<()> {
+        let _privilege = ManageVolumePrivilege::enable()?;
+        let h = open(path, true, false)?;
+        unsafe {
+            check(
+                AttachVirtualDisk(
+                    h.0,
+                    None,
+                    ATTACH_VIRTUAL_DISK_FLAG_PERMANENT_LIFETIME
+                        | ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER,
+                    0,
+                    None,
+                    None,
+                ),
+                "挂载虚拟磁盘",
+            )
+        }
+    }
+    pub fn detach(path: &Path) -> Result<()> {
+        let _privilege = ManageVolumePrivilege::enable()?;
+        let h = open(path, false, false)?;
+        unsafe {
+            check(
+                DetachVirtualDisk(h.0, DETACH_VIRTUAL_DISK_FLAG_NONE, 0),
+                "卸载虚拟磁盘",
+            )
+        }
+    }
+    /// Lock every filesystem volume before detach; busy volumes remain attached.
+    pub fn safe_detach(path: &Path, roots: &[String]) -> Result<()> {
+        let mut locks = Vec::new();
+        let mut names = std::collections::HashSet::new();
+        for root in roots {
+            let root_wide = wide(Path::new(root))?;
+            let mut volume = vec![0u16; 1024];
+            unsafe {
+                GetVolumeNameForVolumeMountPointW(PCWSTR(root_wide.as_ptr()), &mut volume)
+                    .with_context(|| format!("无法识别卷 {root}"))?;
+            }
+            let end = volume.iter().position(|&c| c == 0).context("卷路径无效")?;
+            let name = String::from_utf16_lossy(&volume[..end])
+                .trim_end_matches('\\')
+                .to_owned();
+            if !names.insert(name.clone()) {
+                continue;
+            }
+            let name_wide = wide(Path::new(&name))?;
+            let handle = Handle(unsafe {
+                CreateFileW(
+                    PCWSTR(name_wide.as_ptr()),
+                    GENERIC_READ.0 | GENERIC_WRITE.0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    None,
+                )
+                .with_context(|| format!("无法打开卷 {root}，请关闭占用它的程序"))?
+            });
+            let mut returned = 0;
+            unsafe {
+                DeviceIoControl(
+                    handle.0,
+                    FSCTL_LOCK_VOLUME,
+                    None,
+                    0,
+                    None,
+                    0,
+                    Some(&mut returned),
+                    None,
+                )
+                .with_context(|| format!("磁盘 {root} 正在使用，请保存文件并关闭占用程序后重试"))?;
+            }
+            locks.push(handle);
+        }
+        // Handles remain alive during detach. Drop releases locks on errors.
+        detach(path)
+    }
+    pub fn physical_path(path: &Path) -> Result<String> {
+        physical(&open(path, false, false)?)
+    }
+    pub fn relocate_parent(diff: &Path, base: &Path) -> Result<()> {
+        if inspect(diff)?.attached {
+            bail!("请先卸载差分盘，再重新定位父镜像")
+        }
+        if paths::image_format(base)? != paths::image_format(diff)? {
+            bail!("基础镜像与差分格式必须一致")
+        }
+        validate_parent(diff, base)?;
+        let h = open(diff, true, true)?;
+        let p = wide(base)?;
+        let value = SET_VIRTUAL_DISK_INFO {
+            Version: SET_VIRTUAL_DISK_INFO_PARENT_PATH,
+            Anonymous: SET_VIRTUAL_DISK_INFO_0 {
+                ParentFilePath: PCWSTR(p.as_ptr()),
+            },
+        };
+        unsafe {
+            check(SetVirtualDiskInformation(h.0, &value), "更新父镜像路径")?;
+        }
+        drop(h);
+        // Opening the complete chain lets Windows perform its own linkage validation.
+        let _ = open(diff, false, false).context("父路径已更新，但 Windows 无法打开完整父链")?;
+        Ok(())
+    }
+    fn dependency_image(physical: &str) -> Result<Option<PathBuf>> {
+        let p = wide(Path::new(physical))?;
+        let h = Handle(unsafe {
+            CreateFileW(
+                PCWSTR(p.as_ptr()),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )?
+        });
+        let mut buffer = vec![0u64; 32768];
+        let ptr = buffer.as_mut_ptr().cast::<STORAGE_DEPENDENCY_INFO>();
+        unsafe {
+            (*ptr).Version = STORAGE_DEPENDENCY_INFO_VERSION_2;
+            check(
+                GetStorageDependencyInformation(
+                    h.0,
+                    GET_STORAGE_DEPENDENCY_FLAG_DISK_HANDLE,
+                    (buffer.len() * 8) as u32,
+                    ptr,
+                    None,
+                ),
+                "查询磁盘镜像依赖",
+            )?;
+            let offset = offset_of!(STORAGE_DEPENDENCY_INFO, Anonymous);
+            let max_entries =
+                (buffer.len() * 8 - offset) / size_of::<STORAGE_DEPENDENCY_INFO_TYPE_2>();
+            let count = (*ptr).NumberEntries as usize;
+            if count > max_entries {
+                bail!("虚拟磁盘依赖响应长度无效")
+            }
+            let entries = std::slice::from_raw_parts(
+                std::ptr::addr_of!((*ptr).Anonymous).cast::<STORAGE_DEPENDENCY_INFO_TYPE_2>(),
+                count,
+            );
+            if let Some(entry) = entries
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e.VirtualStorageType.DeviceId,
+                        VIRTUAL_STORAGE_TYPE_DEVICE_VHD | VIRTUAL_STORAGE_TYPE_DEVICE_VHDX
+                    )
+                })
+                .min_by_key(|e| e.AncestorLevel)
+            {
+                let read = |p: PWSTR| -> Result<String> {
+                    if p.is_null() {
+                        return Ok(String::new());
+                    }
+                    let addr = p.0 as usize;
+                    let start = buffer.as_ptr() as usize;
+                    let end = start + buffer.len() * 8;
+                    if addr < start || addr >= end || addr % 2 != 0 {
+                        bail!("依赖路径指针无效")
+                    }
+                    let chars = std::slice::from_raw_parts(p.0, (end - addr) / 2);
+                    let n = chars
+                        .iter()
+                        .position(|&c| c == 0)
+                        .context("依赖路径未终止")?;
+                    Ok(String::from_utf16_lossy(&chars[..n]))
+                };
+                let host = read(entry.HostVolumeName)?;
+                let relative = read(entry.DependentVolumeRelativePath)?;
+                if !host.is_empty() && !relative.is_empty() {
+                    return Ok(Some(PathBuf::from(format!(
+                        "{}\\{}",
+                        host.trim_end_matches('\\'),
+                        relative.trim_start_matches('\\')
+                    ))));
+                }
+            }
+        }
+        Ok(None)
+    }
+    pub fn attached_paths() -> Result<Vec<AttachedPath>> {
+        let mut chars = vec![0u16; 32768];
+        let mut bytes = (chars.len() * 2) as u32;
+        unsafe {
+            let code =
+                GetAllAttachedVirtualDiskPhysicalPaths(&mut bytes, PWSTR(chars.as_mut_ptr()));
+            if code.0 == 122 {
+                chars.resize(bytes as usize / 2 + 1, 0);
+                check(
+                    GetAllAttachedVirtualDiskPhysicalPaths(&mut bytes, PWSTR(chars.as_mut_ptr())),
+                    "枚举虚拟磁盘",
+                )?;
+            } else {
+                check(code, "枚举虚拟磁盘")?;
+            }
+        }
+        Ok(chars
+            .split(|&c| c == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                let physical = String::from_utf16_lossy(s);
+                let image = dependency_image(&physical).ok().flatten();
+                AttachedPath { physical, image }
+            })
+            .collect())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use sha2::{Digest, Sha256};
+        fn digest(path: &Path) -> Vec<u8> {
+            Sha256::digest(std::fs::read(path).unwrap()).to_vec()
+        }
+
+        #[test]
+        fn scratch_children_preserve_parent_and_relocate_safely() {
+            // Create-only fixture: never attaches, initializes, or formats disks.
+            let temp = tempfile::tempdir().unwrap();
+            for ext in ["vhd", "vhdx"] {
+                let base = temp.path().join(format!("base.{ext}"));
+                let child = temp.path().join(format!("child.{ext}"));
+                let relocated = temp.path().join(format!("moved.{ext}"));
+                let unrelated = temp.path().join(format!("unrelated.{ext}"));
+                create_dynamic(&base, 64 * 1024 * 1024).unwrap();
+                if ext == "vhdx" {
+                    // The VHDX linkage is its active header DataWriteGuid,
+                    // not the persistent guest-visible VirtualDiskId.
+                    let bytes = std::fs::read(&base).unwrap();
+                    let a = &bytes[64 * 1024..64 * 1024 + 4096];
+                    let b = &bytes[128 * 1024..128 * 1024 + 4096];
+                    let seq = |h: &[u8]| u64::from_le_bytes(h[8..16].try_into().unwrap());
+                    let header = if seq(a) > seq(b) { a } else { b };
+                    assert_eq!(&header[..4], b"head");
+                    let raw = &header[32..48];
+                    let linkage = windows::core::GUID::from_values(
+                        u32::from_le_bytes(raw[..4].try_into().unwrap()),
+                        u16::from_le_bytes(raw[4..6].try_into().unwrap()),
+                        u16::from_le_bytes(raw[6..8].try_into().unwrap()),
+                        raw[8..16].try_into().unwrap(),
+                    );
+                    let h = open(&base, false, true).unwrap();
+                    assert_eq!(
+                        unsafe {
+                            info(&h, GET_VIRTUAL_DISK_INFO_IDENTIFIER)
+                                .unwrap()
+                                .Anonymous
+                                .Identifier
+                        },
+                        linkage
+                    );
+                }
+                let initial_hash = digest(&base);
+                create_difference(&base, &child).unwrap();
+                assert_eq!(digest(&base), initial_hash, "creating child changed parent");
+                assert_eq!(inspect(&child).unwrap().kind, DiskKind::Differencing);
+                validate_parent(&child, &base).unwrap();
+                std::fs::copy(&base, &relocated).unwrap();
+                relocate_parent(&child, &relocated).unwrap();
+                assert!(paths::same_path(
+                    &inspect(&child).unwrap().parent.unwrap(),
+                    &relocated
+                ));
+                assert_eq!(
+                    digest(&relocated),
+                    initial_hash,
+                    "relocating child changed parent"
+                );
+                create_dynamic(&unrelated, 64 * 1024 * 1024).unwrap();
+                let child_before_rejection = digest(&child);
+                assert!(relocate_parent(&child, &unrelated).is_err());
+                assert_eq!(
+                    digest(&child),
+                    child_before_rejection,
+                    "rejected relocation modified child"
+                );
+            }
+        }
+
+        #[test]
+        fn native_path_rejects_embedded_nul_before_api() {
+            assert!(wide(Path::new("bad\0name.vhdx")).is_err());
+            let unicode = wide(Path::new("备份.vhdx")).unwrap();
+            assert_eq!(unicode.last(), Some(&0));
+        }
+
+        #[test]
+        #[ignore = "read-only live Windows discovery probe"]
+        fn read_only_discovery_probe() {
+            for disk in attached_paths().unwrap() {
+                println!("{disk:?}");
+            }
+        }
+    }
+}

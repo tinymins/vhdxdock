@@ -1,7 +1,1519 @@
-pub struct DockApp;
-impl DockApp { pub fn new(_: &eframe::CreationContext<'_>) -> Self { Self } }
+use eframe::egui::{self, Color32, RichText, Stroke, Vec2};
+use std::{
+    collections::VecDeque,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
+    time::{Duration, Instant},
+};
+use vhdxdock::{
+    backend, builder,
+    config::{self, AppConfig},
+    models::*,
+    paths,
+};
+
+const ACCENT: Color32 = Color32::from_rgb(13, 115, 119);
+const TEXT: Color32 = Color32::from_rgb(30, 44, 60);
+const MUTED: Color32 = Color32::from_rgb(100, 116, 139);
+const BORDER: Color32 = Color32::from_rgb(221, 228, 235);
+
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    Mount,
+    Build,
+}
+
+enum Event {
+    Disks {
+        action: String,
+        result: Result<Vec<MountedImage>, String>,
+    },
+    Progress(Progress),
+    Built(Result<BuildResult, String>),
+    Opened(Result<(), String>),
+}
+
+struct EjectConfirmation {
+    image: MountedImage,
+    focus_cancel: bool,
+}
+
+pub struct DockApp {
+    settings: AppConfig,
+    tab: Tab,
+    disks: Vec<MountedImage>,
+    tx: mpsc::Sender<Event>,
+    rx: mpsc::Receiver<Event>,
+    disk_busy: Option<String>,
+    building: bool,
+    cancel: Arc<AtomicBool>,
+    progress: Progress,
+    build_started: Option<Instant>,
+    build_result: Option<BuildResult>,
+    logs: VecDeque<String>,
+    log_tx: Option<mpsc::Sender<String>>,
+    notice: Option<(String, bool)>,
+    diff_manual: bool,
+    last_auto_base: String,
+    eject: Option<EjectConfirmation>,
+    open_volumes: Option<Vec<String>>,
+    close_confirmation: bool,
+    close_focus_cancel: bool,
+    exit_when_idle: bool,
+    relocate_diff: String,
+    relocate_base: String,
+    relocation_confirmation: bool,
+    relocation_focus_cancel: bool,
+    config_dirty: bool,
+    last_save: Instant,
+}
+
+impl DockApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        install_style(&cc.egui_ctx);
+        let settings = AppConfig::load();
+        if let Some([width, height]) = settings.window_size {
+            cc.egui_ctx
+                .send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(
+                    width.max(900.0),
+                    height.max(650.0),
+                )));
+        }
+        let mut app = Self::with_settings(settings);
+        app.log_tx = Some(start_log_writer());
+        app.log("VhdxDock 已启动");
+        app.refresh();
+        app
+    }
+
+    fn with_settings(settings: AppConfig) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let diff_manual = !settings.diff_path.trim().is_empty()
+            && !Self::resolved(&settings.base_path)
+                .and_then(|base| paths::default_diff(&base).map_err(|e| e.to_string()))
+                .ok()
+                .zip(Self::resolved(&settings.diff_path).ok())
+                .is_some_and(|(default, actual)| paths::same_path(&default, &actual));
+        let last_auto_base = settings.base_path.clone();
+        Self {
+            settings,
+            tab: Tab::Mount,
+            disks: Vec::new(),
+            tx,
+            rx,
+            disk_busy: None,
+            building: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+            progress: Progress::default(),
+            build_started: None,
+            build_result: None,
+            logs: VecDeque::new(),
+            log_tx: None,
+            notice: None,
+            diff_manual,
+            last_auto_base,
+            eject: None,
+            open_volumes: None,
+            close_confirmation: false,
+            close_focus_cancel: false,
+            exit_when_idle: false,
+            relocate_diff: String::new(),
+            relocate_base: String::new(),
+            relocation_confirmation: false,
+            relocation_focus_cancel: false,
+            config_dirty: false,
+            last_save: Instant::now(),
+        }
+    }
+
+    fn log(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        if let Some(writer) = &self.log_tx {
+            let _ = writer.send(message.clone());
+        }
+        self.logs.push_back(message);
+        while self.logs.len() > 400 {
+            self.logs.pop_front();
+        }
+    }
+
+    fn report(&mut self, message: impl Into<String>, error: bool) {
+        let message = message.into();
+        self.log(message.clone());
+        self.notice = Some((message, error));
+    }
+
+    fn save(&mut self) {
+        if let Err(error) = self.settings.save() {
+            self.log(format!("配置保存失败：{error:#}"));
+        }
+        self.config_dirty = false;
+        self.last_save = Instant::now();
+    }
+
+    fn resolved(input: &str) -> Result<PathBuf, String> {
+        if input.trim().is_empty() {
+            return Err("请先填写路径。".into());
+        }
+        paths::resolve(Path::new(input.trim())).map_err(|e| format!("路径无效：{e:#}"))
+    }
+
+    fn set_default_diff(&mut self) {
+        if !self.diff_manual && !self.settings.base_path.trim().is_empty() {
+            // A partially typed base path is normal while editing this field.
+            if let Ok(path) = Self::resolved(&self.settings.base_path)
+                .and_then(|base| paths::default_diff(&base).map_err(|e| format!("{e:#}")))
+            {
+                self.settings.diff_path = path
+                    .strip_prefix(config::exe_dir())
+                    .map(|relative| format!(".{}{}", std::path::MAIN_SEPARATOR, relative.display()))
+                    .unwrap_or_else(|_| path.display().to_string());
+            }
+        }
+        self.last_auto_base = self.settings.base_path.clone();
+        self.config_dirty = true;
+    }
+
+    fn refresh(&mut self) {
+        if self.disk_busy.is_some() {
+            return;
+        }
+        self.disk_busy = Some("正在读取已挂载镜像".into());
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = backend::list_mounted().map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Event::Disks {
+                action: "已刷新挂载列表".into(),
+                result,
+            });
+        });
+    }
+
+    fn mount(&mut self) {
+        let request = match (
+            Self::resolved(&self.settings.base_path),
+            Self::resolved(&self.settings.diff_path),
+        ) {
+            (Ok(base), Ok(diff)) => MountRequest {
+                base,
+                diff,
+                drive_letter: self.settings.drive_letter,
+            },
+            (Err(error), _) | (_, Err(error)) => {
+                self.report(error, true);
+                return;
+            }
+        };
+        self.save();
+        self.disk_busy = Some("正在检查父镜像、创建差分并挂载".into());
+        self.notice = None;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = backend::mount(request).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Event::Disks {
+                action: "镜像已挂载，修改将保存在差分盘中".into(),
+                result,
+            });
+        });
+    }
+
+    fn unmount(&mut self, path: PathBuf) {
+        self.disk_busy = Some("正在卸载镜像".into());
+        self.notice = None;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = backend::unmount(&path)
+                .and_then(|_| backend::list_mounted())
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Event::Disks {
+                action: "镜像已卸载，差分中的修改已保留".into(),
+                result,
+            });
+        });
+    }
+
+    fn relocate(&mut self) {
+        let (diff, base) = match (
+            Self::resolved(&self.relocate_diff),
+            Self::resolved(&self.relocate_base),
+        ) {
+            (Ok(diff), Ok(base)) => (diff, base),
+            (Err(error), _) | (_, Err(error)) => {
+                self.report(error, true);
+                return;
+            }
+        };
+        self.disk_busy = Some("正在验证并更新父镜像路径".into());
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = backend::relocate(&diff, &base)
+                .and_then(|_| backend::list_mounted())
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Event::Disks {
+                action: "基础镜像路径已更新".into(),
+                result,
+            });
+        });
+    }
+
+    fn start_build(&mut self) {
+        let request = match (
+            Self::resolved(&self.settings.source_path),
+            Self::resolved(&self.settings.output_path),
+        ) {
+            (Ok(source), Ok(output)) => BuildRequest {
+                source,
+                output,
+                capacity_gib: self.settings.capacity_gib,
+                compress: self.settings.compress,
+                verify: self.settings.verify,
+            },
+            (Err(error), _) | (_, Err(error)) => {
+                self.report(error, true);
+                return;
+            }
+        };
+        self.save();
+        self.cancel = Arc::new(AtomicBool::new(false));
+        self.building = true;
+        self.build_started = Some(Instant::now());
+        self.build_result = None;
+        self.progress = Progress {
+            phase: "准备制作".into(),
+            message: "正在检查路径与输出位置".into(),
+            ..Default::default()
+        };
+        self.notice = None;
+        self.log(format!(
+            "开始制作：{} → {}",
+            request.source.display(),
+            request.output.display()
+        ));
+        let cancel = self.cancel.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let progress_tx = tx.clone();
+            let result = builder::build(request, cancel, move |progress| {
+                let _ = progress_tx.send(Event::Progress(progress));
+            })
+            .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Event::Built(result));
+        });
+    }
+
+    fn poll_events(&mut self, ctx: &egui::Context) {
+        for _ in 0..2_000 {
+            let Ok(event) = self.rx.try_recv() else {
+                break;
+            };
+            match event {
+                Event::Disks { action, result } => {
+                    self.disk_busy = None;
+                    match result {
+                        Ok(disks) => {
+                            self.disks = disks;
+                            self.report(action, false);
+                        }
+                        Err(error) => self.report(error, true),
+                    }
+                }
+                Event::Progress(progress) => {
+                    if progress.phase != self.progress.phase {
+                        self.log(format!("{}：{}", progress.phase, progress.message));
+                    }
+                    self.progress = progress;
+                }
+                Event::Built(result) => {
+                    self.building = false;
+                    // A close prompt opened during a build should not claim the
+                    // task is still running after it has naturally completed.
+                    self.close_confirmation = false;
+                    match result {
+                        Ok(result) => {
+                            self.report(
+                                format!(
+                                    "制作完成：{}（{}）",
+                                    result.output.display(),
+                                    paths::format_bytes(result.image_bytes)
+                                ),
+                                false,
+                            );
+                            self.build_result = Some(result);
+                        }
+                        Err(error) => self.report(error, !self.cancel.load(Ordering::Relaxed)),
+                    }
+                    if self.exit_when_idle {
+                        self.save();
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+                Event::Opened(result) => {
+                    if let Err(error) = result {
+                        self.report(error, true);
+                    }
+                }
+            }
+        }
+    }
+
+    fn open_disk(&mut self, volumes: Vec<String>) {
+        if volumes.len() > 1 {
+            self.open_volumes = Some(volumes);
+        } else if let Some(volume) = volumes.into_iter().next() {
+            self.open_path(volume);
+        }
+    }
+
+    fn open_path(&self, path: String) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            #[cfg(windows)]
+            let result = std::process::Command::new("explorer.exe")
+                .arg(&path)
+                .spawn();
+            #[cfg(not(windows))]
+            let result = std::process::Command::new("xdg-open").arg(&path).spawn();
+            let result = result
+                .map(|_| ())
+                .map_err(|e| format!("无法打开 {path}：{e}"));
+            let _ = tx.send(Event::Opened(result));
+        });
+    }
+
+    fn header(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            brand_icon(ui);
+            ui.vertical(|ui| {
+                ui.heading(RichText::new("VhdxDock").size(27.0).color(TEXT));
+                ui.label(RichText::new("镜像归档 · 本地差分 · 随时接入").color(MUTED));
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new("WINDOWS  /  VHD + VHDX")
+                        .size(11.0)
+                        .color(MUTED),
+                );
+            });
+        });
+        ui.add_space(18.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            for (tab, title) in [(Tab::Mount, "挂载镜像"), (Tab::Build, "制作镜像")] {
+                let selected = self.tab == tab;
+                let button =
+                    egui::Button::new(RichText::new(title).size(15.0).color(if selected {
+                        Color32::WHITE
+                    } else {
+                        TEXT
+                    }))
+                    .fill(if selected { ACCENT } else { Color32::WHITE })
+                    .stroke(Stroke::new(1.0, if selected { ACCENT } else { BORDER }))
+                    .min_size(Vec2::new(124.0, 38.0))
+                    .corner_radius(7.0);
+                if ui.add(button).clicked() {
+                    self.tab = tab;
+                }
+            }
+        });
+        ui.add_space(18.0);
+    }
+
+    fn mount_page(&mut self, ui: &mut egui::Ui) {
+        card(ui, |ui| {
+            ui.label(RichText::new("接入基础镜像").strong().size(17.0));
+            ui.label(
+                RichText::new("从 NAS 或本地读取基础镜像，修改保存到本地差分盘。").color(MUTED),
+            );
+            ui.add_space(15.0);
+            ui.add_enabled_ui(self.disk_busy.is_none(), |ui| {
+                let base_changed =
+                    path_input(ui, "基础镜像", &mut self.settings.base_path, Browse::Image);
+                if base_changed {
+                    self.set_default_diff();
+                }
+                ui.add_space(9.0);
+                if path_input(
+                    ui,
+                    "本地差分镜像",
+                    &mut self.settings.diff_path,
+                    Browse::SaveDiff,
+                ) {
+                    self.diff_manual = !self.settings.diff_path.trim().is_empty();
+                    self.config_dirty = true;
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("实际路径：").size(12.0).color(MUTED));
+                    let preview = Self::resolved(&self.settings.diff_path)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| "选择基础镜像后自动生成".into());
+                    ui.label(RichText::new(preview).size(12.0).color(MUTED));
+                });
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("相对路径以软件所在目录为起点")
+                            .size(12.0)
+                            .color(MUTED),
+                    );
+                    if ui.small_button("恢复默认差分路径").clicked() {
+                        self.diff_manual = false;
+                        self.set_default_diff();
+                    }
+                });
+                ui.add_space(13.0);
+                ui.horizontal(|ui| {
+                    ui.label("盘符");
+                    let old_letter = self.settings.drive_letter;
+                    let selected = self
+                        .settings
+                        .drive_letter
+                        .map(|d| format!("{d}:"))
+                        .unwrap_or_else(|| "自动".into());
+                    egui::ComboBox::from_id_salt("drive_letter")
+                        .selected_text(selected)
+                        .width(85.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.settings.drive_letter, None, "自动");
+                            for letter in 'A'..='Z' {
+                                let used = self.disks.iter().flat_map(|disk| &disk.volumes).any(
+                                    |volume| {
+                                        volume.to_uppercase().starts_with(&format!("{letter}:"))
+                                    },
+                                );
+                                ui.add_enabled_ui(
+                                    !used || self.settings.drive_letter == Some(letter),
+                                    |ui| {
+                                        ui.selectable_value(
+                                            &mut self.settings.drive_letter,
+                                            Some(letter),
+                                            format!(
+                                                "{letter}:{}",
+                                                if used { "  已使用" } else { "" }
+                                            ),
+                                        );
+                                    },
+                                );
+                            }
+                        });
+                    self.config_dirty |= old_letter != self.settings.drive_letter;
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let enabled = !self.settings.base_path.trim().is_empty()
+                            && !self.settings.diff_path.trim().is_empty();
+                        if ui.add_enabled(enabled, primary("挂载", 106.0)).clicked() {
+                            self.mount();
+                        }
+                        ui.label(
+                            RichText::new("差分不存在时自动创建")
+                                .size(12.0)
+                                .color(MUTED),
+                        );
+                    });
+                });
+            });
+        });
+        ui.add_space(14.0);
+        self.mounted_list(ui);
+        ui.add_space(12.0);
+        egui::CollapsingHeader::new("高级 · 重新定位基础镜像").id_salt("relocate").show(ui, |ui| {
+            card(ui, |ui| {
+                ui.label(RichText::new("将 base 搬到 NAS 后，为已卸载的差分盘更新父路径。只有父链身份匹配时才能关联。").color(MUTED));
+                ui.add_space(8.0);
+                ui.add_enabled_ui(self.disk_busy.is_none(), |ui| {
+                    path_input(ui, "已有差分", &mut self.relocate_diff, Browse::Image);
+                    ui.add_space(8.0);
+                    path_input(ui, "新的基础镜像", &mut self.relocate_base, Browse::Image);
+                    ui.add_space(8.0);
+                    if ui.add_enabled(!self.relocate_diff.trim().is_empty() && !self.relocate_base.trim().is_empty(), egui::Button::new("验证并更新父路径")).clicked() {
+                        self.relocation_confirmation = true;
+                        self.relocation_focus_cancel = true;
+                    }
+                });
+            });
+        });
+    }
+
+    fn mounted_list(&mut self, ui: &mut egui::Ui) {
+        let mut open = None;
+        let mut eject = None;
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("已挂载镜像").strong().size(17.0));
+                ui.label(RichText::new(format!("{} 个", self.disks.len())).color(MUTED));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(self.disk_busy.is_none(), egui::Button::new("刷新"))
+                        .clicked()
+                    {
+                        self.refresh();
+                    }
+                    if self.disk_busy.is_some() {
+                        ui.spinner();
+                    }
+                });
+            });
+            ui.add_space(10.0);
+            if self.disks.is_empty() {
+                ui.add_space(15.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("尚无已挂载镜像").color(MUTED).size(16.0));
+                    ui.label(
+                        RichText::new("挂载后将在这里显示，可同时管理多个磁盘")
+                            .color(MUTED)
+                            .size(12.0),
+                    );
+                });
+                ui.add_space(20.0);
+            } else {
+                let available = ui.available_width();
+                egui::Grid::new("mounted_images")
+                    .num_columns(4)
+                    .spacing([12.0, 12.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for header in ["盘符 / 状态", "挂载镜像", "基础镜像", "操作"]
+                        {
+                            ui.label(RichText::new(header).size(12.0).color(MUTED));
+                        }
+                        ui.end_row();
+                        for disk in &self.disks {
+                            ui.vertical(|ui| {
+                                ui.set_min_width(94.0);
+                                ui.label(
+                                    RichText::new(if disk.volumes.is_empty() {
+                                        "无盘符".into()
+                                    } else {
+                                        disk.volumes.join("  ")
+                                    })
+                                    .strong(),
+                                );
+                                ui.label(
+                                    RichText::new(if disk.read_only {
+                                        "只读"
+                                    } else {
+                                        "可读写"
+                                    })
+                                    .size(11.0)
+                                    .color(if disk.read_only { MUTED } else { ACCENT }),
+                                );
+                            });
+                            let path_width = ((available - 220.0) / 2.0).max(130.0);
+                            ui.vertical(|ui| {
+                                truncated_path(
+                                    ui,
+                                    &disk.image_path.display().to_string(),
+                                    path_width,
+                                );
+                                ui.label(RichText::new(&disk.kind).color(MUTED).size(11.0));
+                                if let Some(warning) = &disk.warning {
+                                    ui.label(
+                                        RichText::new("需注意")
+                                            .color(Color32::from_rgb(160, 95, 20))
+                                            .size(11.0),
+                                    )
+                                    .on_hover_text(warning);
+                                }
+                            });
+                            truncated_path(
+                                ui,
+                                &disk
+                                    .parent_path
+                                    .as_ref()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_else(|| "直接挂载".into()),
+                                path_width,
+                            );
+                            ui.horizontal(|ui| {
+                                if icon_button(
+                                    ui,
+                                    Icon::Folder,
+                                    !disk.volumes.is_empty(),
+                                    "打开磁盘",
+                                )
+                                .clicked()
+                                {
+                                    open = Some(disk.volumes.clone());
+                                }
+                                if icon_button(
+                                    ui,
+                                    Icon::Eject,
+                                    disk.can_eject && self.disk_busy.is_none(),
+                                    if disk.can_eject {
+                                        "卸载磁盘"
+                                    } else {
+                                        "此磁盘受保护，不能在此卸载"
+                                    },
+                                )
+                                .clicked()
+                                {
+                                    eject = Some(disk.clone());
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+            }
+            ui.label(
+                RichText::new("关闭软件后磁盘继续挂载；弹出保留差分中的修改。")
+                    .size(12.0)
+                    .color(MUTED),
+            );
+        });
+        if let Some(volumes) = open {
+            self.open_disk(volumes);
+        }
+        if let Some(image) = eject {
+            self.eject = Some(EjectConfirmation {
+                image,
+                focus_cancel: true,
+            });
+        }
+    }
+
+    fn build_page(&mut self, ui: &mut egui::Ui) {
+        card(ui, |ui| {
+            ui.label(RichText::new("将文件夹封装为基础镜像").strong().size(17.0));
+            ui.label(
+                RichText::new("文件夹内容直接放在镜像根目录。制作期间请停止修改源文件。")
+                    .color(MUTED),
+            );
+            ui.add_space(15.0);
+            ui.add_enabled_ui(!self.building, |ui| {
+                self.config_dirty |= path_input(
+                    ui,
+                    "源文件夹",
+                    &mut self.settings.source_path,
+                    Browse::Folder,
+                );
+                ui.add_space(10.0);
+                self.config_dirty |= path_input(
+                    ui,
+                    "输出镜像",
+                    &mut self.settings.output_path,
+                    Browse::SaveVhdx,
+                );
+                ui.label(
+                    RichText::new(
+                        "制作中使用同目录的 .vhdx.partial；完成校验并卸载后去掉 .partial。",
+                    )
+                    .size(12.0)
+                    .color(MUTED),
+                );
+                ui.label(
+                    RichText::new("镜像全程写入指定位置，不占用软件所在盘存放镜像。")
+                        .size(12.0)
+                        .color(MUTED),
+                );
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    ui.label("虚拟容量");
+                    self.config_dirty |= ui
+                        .add(
+                            egui::DragValue::new(&mut self.settings.capacity_gib)
+                                .range(1..=65_536)
+                                .speed(16.0)
+                                .suffix(" GiB"),
+                        )
+                        .changed();
+                    ui.add_space(20.0);
+                    self.config_dirty |= ui
+                        .checkbox(&mut self.settings.compress, "NTFS 压缩")
+                        .changed();
+                });
+                ui.label(
+                    RichText::new("动态镜像按写入量增长；虚拟容量是盘内空间上限。")
+                        .size(12.0)
+                        .color(MUTED),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label("校验方式");
+                    let old_verify = self.settings.verify;
+                    egui::ComboBox::from_id_salt("verify_mode")
+                        .width(205.0)
+                        .selected_text(match self.settings.verify {
+                            VerifyMode::Metadata => "文件信息比较",
+                            VerifyMode::Sha256 => "文件内容 SHA-256",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.settings.verify,
+                                VerifyMode::Metadata,
+                                "文件信息比较",
+                            );
+                            ui.selectable_value(
+                                &mut self.settings.verify,
+                                VerifyMode::Sha256,
+                                "文件内容 SHA-256",
+                            );
+                        });
+                    self.config_dirty |= old_verify != self.settings.verify;
+                });
+                ui.label(
+                    RichText::new(if self.settings.verify == VerifyMode::Metadata {
+                        "比较路径、大小和时间；完成后另外生成整个镜像的 SHA-256。"
+                    } else {
+                        "逐文件校验内容，耗时更长；完成后另外生成整个镜像的 SHA-256。"
+                    })
+                    .size(12.0)
+                    .color(MUTED),
+                );
+            });
+            ui.add_space(17.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !self.building
+                            && !self.settings.source_path.trim().is_empty()
+                            && !self.settings.output_path.trim().is_empty(),
+                        primary("开始制作", 124.0),
+                    )
+                    .clicked()
+                {
+                    self.start_build();
+                }
+                let cancelling = self.cancel.load(Ordering::Relaxed);
+                if ui
+                    .add_enabled(
+                        self.building && !cancelling,
+                        egui::Button::new(if cancelling && self.building {
+                            "正在取消…"
+                        } else {
+                            "取消"
+                        })
+                        .min_size(Vec2::new(85.0, 36.0)),
+                    )
+                    .clicked()
+                {
+                    self.cancel.store(true, Ordering::Relaxed);
+                    self.log("已请求取消，正在等待后台任务停止并卸载镜像。");
+                }
+                ui.label(
+                    RichText::new("失败或取消时保留 .partial 和日志")
+                        .size(12.0)
+                        .color(MUTED),
+                );
+            });
+        });
+        ui.add_space(14.0);
+        if self.building || self.build_result.is_some() {
+            card(ui, |ui| {
+                if self.building {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new(&self.progress.phase).strong().size(16.0));
+                        if let Some(started) = self.build_started {
+                            let secs = started.elapsed().as_secs();
+                            ui.label(
+                                RichText::new(format!(
+                                    "已用时 {:02}:{:02}:{:02}",
+                                    secs / 3600,
+                                    secs / 60 % 60,
+                                    secs % 60
+                                ))
+                                .color(MUTED),
+                            );
+                        }
+                    });
+                    ui.label(&self.progress.message);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "已处理文件：{}{}",
+                                self.progress.files,
+                                if self.progress.total_files > 0 {
+                                    format!(" / {}", self.progress.total_files)
+                                } else {
+                                    String::new()
+                                }
+                            ))
+                            .color(MUTED),
+                        );
+                        ui.add_space(15.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "已处理数据：{}{}",
+                                paths::format_bytes(self.progress.bytes),
+                                if self.progress.total_bytes > 0 {
+                                    format!(" / {}", paths::format_bytes(self.progress.total_bytes))
+                                } else {
+                                    String::new()
+                                }
+                            ))
+                            .color(MUTED),
+                        );
+                    });
+                    if self.exit_when_idle {
+                        ui.label(RichText::new("后台清理完成后自动退出，请稍候。").color(ACCENT));
+                    }
+                } else if let Some(result) = &self.build_result {
+                    ui.label(
+                        RichText::new("基础镜像已完成")
+                            .strong()
+                            .size(17.0)
+                            .color(ACCENT),
+                    );
+                    ui.label(result.output.display().to_string());
+                    ui.label(format!(
+                        "{} 个文件 · 源数据 {} · 镜像大小 {}",
+                        result.files,
+                        paths::format_bytes(result.logical_bytes),
+                        paths::format_bytes(result.image_bytes)
+                    ));
+                    ui.label(
+                        RichText::new(format!("SHA-256：{}", result.sha256))
+                            .size(11.0)
+                            .color(MUTED),
+                    );
+                    if ui.button("填入挂载页面").clicked() {
+                        self.settings.base_path = result.output.display().to_string();
+                        self.diff_manual = false;
+                        self.set_default_diff();
+                        self.tab = Tab::Mount;
+                    }
+                }
+            });
+        }
+    }
+
+    fn dialogs(&mut self, ctx: &egui::Context) {
+        if self.close_confirmation {
+            let mut dismiss = false;
+            let mut cancel_and_exit = false;
+            egui::Modal::new(egui::Id::new("close_build_confirmation")).show(ctx, |ui| {
+                ui.set_width(430.0);
+                ui.heading("镜像仍在制作中");
+                ui.add_space(10.0);
+                ui.label("可以返回继续等待，或取消制作并在后台清理完成后退出。");
+                ui.label(RichText::new("未完成镜像保留为 .partial，源文件不受影响。").color(MUTED));
+                ui.add_space(15.0);
+                ui.horizontal(|ui| {
+                    let response = ui.button("返回");
+                    if self.close_focus_cancel {
+                        response.request_focus();
+                        self.close_focus_cancel = false;
+                    }
+                    dismiss = response.clicked();
+                    cancel_and_exit = ui.button("取消制作并退出").clicked();
+                });
+            });
+            if dismiss {
+                self.close_confirmation = false;
+            }
+            if cancel_and_exit {
+                self.close_confirmation = false;
+                self.exit_when_idle = true;
+                self.cancel.store(true, Ordering::Relaxed);
+                if !self.building {
+                    self.save();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+            return;
+        }
+        if let Some(confirmation) = &mut self.eject {
+            let mut dismiss = false;
+            let mut confirm = false;
+            egui::Modal::new(egui::Id::new("eject_confirmation")).show(ctx, |ui| {
+                ui.set_width(460.0);
+                ui.heading(format!(
+                    "确认卸载 {}？",
+                    if confirmation.image.volumes.is_empty() {
+                        "此镜像".into()
+                    } else {
+                        confirmation.image.volumes.join("、")
+                    }
+                ));
+                ui.add_space(10.0);
+                ui.label("挂载镜像：");
+                ui.label(confirmation.image.image_path.display().to_string());
+                ui.add_space(10.0);
+                ui.label("卸载后已保存的修改仍保留，请先保存并关闭盘内文件。");
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    let response = ui.button("取消");
+                    if confirmation.focus_cancel {
+                        response.request_focus();
+                        confirmation.focus_cancel = false;
+                    }
+                    dismiss = response.clicked();
+                    confirm = ui
+                        .add_enabled(self.disk_busy.is_none(), primary("卸载", 80.0))
+                        .clicked();
+                });
+            });
+            if confirm {
+                let image = self.eject.take().unwrap().image;
+                self.unmount(image.image_path);
+            } else if dismiss {
+                self.eject = None;
+            }
+        }
+        if let Some(volumes) = &self.open_volumes {
+            let mut chosen = None;
+            let mut dismiss = false;
+            egui::Modal::new(egui::Id::new("open_volume")).show(ctx, |ui| {
+                ui.set_width(340.0);
+                ui.heading("选择要打开的卷");
+                ui.add_space(12.0);
+                for volume in volumes {
+                    if ui.button(volume).clicked() {
+                        chosen = Some(volume.clone());
+                    }
+                }
+                ui.add_space(12.0);
+                dismiss = ui.button("取消").clicked();
+            });
+            if let Some(volume) = chosen {
+                self.open_volumes = None;
+                self.open_path(volume);
+            } else if dismiss {
+                self.open_volumes = None;
+            }
+        }
+        if self.relocation_confirmation {
+            let mut dismiss = false;
+            let mut confirm = false;
+            egui::Modal::new(egui::Id::new("relocate_confirmation")).show(ctx, |ui| {
+                ui.set_width(460.0);
+                ui.heading("确认更新父镜像路径？");
+                ui.add_space(10.0);
+                ui.label(format!("差分：{}", self.relocate_diff));
+                ui.label(format!("基础：{}", self.relocate_base));
+                ui.label(
+                    RichText::new("差分必须已卸载。工具将验证父链身份，不会强制忽略不匹配。")
+                        .color(MUTED),
+                );
+                ui.add_space(15.0);
+                ui.horizontal(|ui| {
+                    let response = ui.button("取消");
+                    if self.relocation_focus_cancel {
+                        response.request_focus();
+                        self.relocation_focus_cancel = false;
+                    }
+                    dismiss = response.clicked();
+                    confirm = ui
+                        .add_enabled(self.disk_busy.is_none(), primary("验证并更新", 110.0))
+                        .clicked();
+                });
+            });
+            if confirm {
+                self.relocation_confirmation = false;
+                self.relocate();
+            } else if dismiss {
+                self.relocation_confirmation = false;
+            }
+        }
+    }
+}
+
 impl eframe::App for DockApp {
-    fn update(&mut self, ctx: &eframe::egui::Context, _: &mut eframe::Frame) {
-        eframe::egui::CentralPanel::default().show(ctx, |ui| { ui.heading("VhdxDock"); ui.label("Development scaffold"); });
+    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        self.poll_events(ctx);
+        if ctx.input(|input| input.viewport().close_requested()) {
+            if self.building {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                if !self.exit_when_idle {
+                    self.close_confirmation = true;
+                    self.close_focus_cancel = true;
+                }
+            } else {
+                self.save();
+            }
+        }
+        if let Some(rect) = ctx.input(|input| input.viewport().inner_rect) {
+            let size = [rect.width(), rect.height()];
+            if self.settings.window_size != Some(size) {
+                self.settings.window_size = Some(size);
+                self.config_dirty = true;
+            }
+        }
+        if self.tab == Tab::Mount && self.disk_busy.is_none() {
+            let dropped = ctx.input(|input| input.raw.dropped_files.clone());
+            if let Some(path) = dropped
+                .into_iter()
+                .filter_map(|file| file.path)
+                .find(|path| {
+                    path.extension().is_some_and(|extension| {
+                        extension.eq_ignore_ascii_case("vhd")
+                            || extension.eq_ignore_ascii_case("vhdx")
+                    })
+                })
+            {
+                self.settings.base_path = path.display().to_string();
+                self.set_default_diff();
+            }
+        }
+        if self.last_auto_base != self.settings.base_path {
+            self.set_default_diff();
+        }
+        egui::TopBottomPanel::bottom("status_bar")
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::WHITE)
+                    .inner_margin(egui::Margin::symmetric(24, 10)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if let Some(action) = &self.disk_busy {
+                        ui.spinner();
+                        ui.label(RichText::new(action).color(ACCENT));
+                    } else {
+                        ui.label(
+                            RichText::new(if self.building {
+                                "制作任务运行中"
+                            } else {
+                                "就绪"
+                            })
+                            .color(MUTED),
+                        );
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                                .size(11.0)
+                                .color(MUTED),
+                        );
+                    });
+                });
+            });
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(245, 247, 250))
+                    .inner_margin(24),
+            )
+            .show(ctx, |ui| {
+                self.header(ui);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        match self.tab {
+                            Tab::Mount => self.mount_page(ui),
+                            Tab::Build => self.build_page(ui),
+                        }
+                        if let Some((message, error)) = &self.notice {
+                            ui.add_space(12.0);
+                            egui::Frame::new()
+                                .fill(if *error {
+                                    Color32::from_rgb(255, 240, 239)
+                                } else {
+                                    Color32::from_rgb(232, 245, 242)
+                                })
+                                .corner_radius(7.0)
+                                .inner_margin(12)
+                                .show(ui, |ui| {
+                                    ui.label(RichText::new(message).color(if *error {
+                                        Color32::from_rgb(164, 46, 41)
+                                    } else {
+                                        ACCENT
+                                    }));
+                                });
+                        }
+                        ui.add_space(12.0);
+                        egui::CollapsingHeader::new(format!("操作日志  ·  {} 条", self.logs.len()))
+                            .id_salt("operation_log")
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("清空显示").clicked() {
+                                        self.logs.clear();
+                                    }
+                                    if ui.small_button("打开日志目录").clicked() {
+                                        self.open_path(
+                                            config::data_dir().join("logs").display().to_string(),
+                                        );
+                                    }
+                                });
+                                egui::ScrollArea::vertical()
+                                    .max_height(180.0)
+                                    .stick_to_bottom(true)
+                                    .show(ui, |ui| {
+                                        for message in &self.logs {
+                                            ui.label(
+                                                RichText::new(message).size(12.0).color(MUTED),
+                                            );
+                                        }
+                                    });
+                            });
+                    });
+            });
+        self.dialogs(ctx);
+        if self.config_dirty && self.last_save.elapsed() >= Duration::from_secs(2) {
+            self.save();
+        }
+        if self.building || self.disk_busy.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        } else {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
+    }
+}
+
+fn primary(label: &str, width: f32) -> egui::Button<'_> {
+    egui::Button::new(RichText::new(label).color(Color32::WHITE))
+        .fill(ACCENT)
+        .min_size(Vec2::new(width, 36.0))
+        .corner_radius(6.0)
+}
+
+fn start_log_writer() -> mpsc::Sender<String> {
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::Write;
+        let directory = config::data_dir().join("logs");
+        if std::fs::create_dir_all(&directory).is_err() {
+            return;
+        }
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(directory.join(format!("session-{timestamp}-{}.log", std::process::id())))
+        else {
+            return;
+        };
+        for message in rx {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let _ = writeln!(file, "[{timestamp}] {message}");
+        }
+    });
+    tx
+}
+
+fn card(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .fill(Color32::WHITE)
+        .stroke(Stroke::new(1.0, BORDER))
+        .corner_radius(10.0)
+        .inner_margin(18)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            content(ui);
+        });
+}
+
+enum Browse {
+    Image,
+    SaveDiff,
+    Folder,
+    SaveVhdx,
+}
+
+fn path_input(ui: &mut egui::Ui, label: &str, value: &mut String, kind: Browse) -> bool {
+    ui.label(RichText::new(label).strong().size(13.0));
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        changed |= ui
+            .add_sized(
+                [ui.available_width() - 70.0, 34.0],
+                egui::TextEdit::singleline(value).hint_text(match kind {
+                    Browse::Image => r"本地路径或 \\NAS\共享\镜像.vhdx",
+                    Browse::SaveDiff => r".\镜像-diff.vhdx",
+                    Browse::Folder => r"E:\需要归档的文件夹",
+                    Browse::SaveVhdx => r"D:\Backup\镜像-base.vhdx",
+                }),
+            )
+            .changed();
+        if ui
+            .add_sized([62.0, 34.0], egui::Button::new("浏览"))
+            .clicked()
+        {
+            let mut dialog = rfd::FileDialog::new();
+            if !value.trim().is_empty() {
+                if let Ok(path) = DockApp::resolved(value) {
+                    if path.is_dir() {
+                        dialog = dialog.set_directory(path);
+                    } else {
+                        if let Some(parent) = path.parent() {
+                            dialog = dialog.set_directory(parent);
+                        }
+                        if let Some(name) = path.file_name() {
+                            dialog = dialog.set_file_name(name.to_string_lossy());
+                        }
+                    }
+                }
+            }
+            let chosen = match kind {
+                Browse::Image => dialog.add_filter("虚拟硬盘", &["vhdx", "vhd"]).pick_file(),
+                Browse::SaveDiff => dialog.add_filter("虚拟硬盘", &["vhdx", "vhd"]).save_file(),
+                Browse::Folder => dialog.pick_folder(),
+                Browse::SaveVhdx => dialog.add_filter("VHDX 镜像", &["vhdx"]).save_file(),
+            };
+            if let Some(path) = chosen {
+                *value = path.display().to_string();
+                changed = true;
+            }
+        }
+    });
+    changed
+}
+
+fn truncated_path(ui: &mut egui::Ui, path: &str, width: f32) {
+    ui.add_sized([width, 23.0], egui::Label::new(path).truncate())
+        .on_hover_text(path);
+}
+
+#[derive(Clone, Copy)]
+enum Icon {
+    Folder,
+    Eject,
+}
+
+fn icon_button(ui: &mut egui::Ui, icon: Icon, enabled: bool, tooltip: &str) -> egui::Response {
+    ui.add_enabled_ui(enabled, |ui| {
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(32.0), egui::Sense::click());
+        let color = if !enabled {
+            Color32::from_rgb(183, 194, 204)
+        } else if response.hovered() {
+            ACCENT
+        } else {
+            MUTED
+        };
+        if response.hovered() && enabled {
+            ui.painter()
+                .rect_filled(rect, 5.0, Color32::from_rgb(231, 242, 243));
+        }
+        let painter = ui.painter();
+        let center = rect.center();
+        let point = |x: f32, y: f32| center + Vec2::new(x, y);
+        let stroke = Stroke::new(1.7, color);
+        match icon {
+            Icon::Folder => {
+                painter.add(egui::Shape::closed_line(
+                    vec![
+                        point(-9.0, -5.0),
+                        point(-9.0, 7.0),
+                        point(9.0, 7.0),
+                        point(9.0, -3.0),
+                        point(-1.0, -3.0),
+                        point(-4.0, -6.0),
+                        point(-9.0, -6.0),
+                    ],
+                    stroke,
+                ));
+                painter.line_segment([point(-8.0, -1.0), point(8.0, -1.0)], stroke);
+            }
+            Icon::Eject => {
+                painter.add(egui::Shape::closed_line(
+                    vec![point(0.0, -8.0), point(-8.0, 2.0), point(8.0, 2.0)],
+                    stroke,
+                ));
+                painter.rect_stroke(
+                    egui::Rect::from_min_max(point(-8.0, 6.0), point(8.0, 9.0)),
+                    0.0,
+                    stroke,
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
+        response.on_hover_text(tooltip)
+    })
+    .inner
+}
+
+fn brand_icon(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(50.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 11.0, ACCENT);
+    let center = rect.center();
+    for offset in [-9.0, 1.0, 11.0] {
+        let points = vec![
+            center + Vec2::new(-14.0, offset - 3.0),
+            center + Vec2::new(0.0, offset - 9.0),
+            center + Vec2::new(14.0, offset - 3.0),
+            center + Vec2::new(0.0, offset + 3.0),
+        ];
+        ui.painter().add(egui::Shape::closed_line(
+            points,
+            Stroke::new(1.6, Color32::WHITE),
+        ));
+    }
+}
+
+fn install_style(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let windows_dir = std::env::var_os("WINDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let candidates = [
+        windows_dir.join("Fonts/msyh.ttc"),
+        windows_dir.join("Fonts/msyh.ttf"),
+        windows_dir.join("Fonts/simhei.ttf"),
+        PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+        PathBuf::from("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"),
+    ];
+    for path in candidates {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts
+                .font_data
+                .insert("cjk".into(), egui::FontData::from_owned(bytes).into());
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "cjk".into());
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .push("cjk".into());
+            break;
+        }
+    }
+    ctx.set_fonts(fonts);
+    let mut style = (*ctx.style()).clone();
+    style.visuals = egui::Visuals::light();
+    style.visuals.override_text_color = Some(TEXT);
+    style.visuals.selection.bg_fill = Color32::from_rgb(199, 231, 229);
+    style.visuals.selection.stroke = Stroke::new(1.0, ACCENT);
+    style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(247, 249, 251);
+    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
+    style.spacing.item_spacing = Vec2::new(8.0, 7.0);
+    style.spacing.button_padding = Vec2::new(12.0, 7.0);
+    style
+        .text_styles
+        .insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
+    ctx.set_style(style);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(1100.0, 900.0),
+            )),
+            events,
+            ..Default::default()
+        }
+    }
+
+    fn rendered_text(shapes: &[egui::epaint::ClippedShape]) -> String {
+        fn collect(shape: &egui::Shape, text: &mut String) {
+            match shape {
+                egui::Shape::Text(shape) => {
+                    text.push_str(&shape.galley.job.text);
+                    text.push('\n');
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, text);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut text = String::new();
+        for shape in shapes {
+            collect(&shape.shape, &mut text);
+        }
+        text
+    }
+
+    fn disk(letter: &str, name: &str) -> MountedImage {
+        MountedImage {
+            image_path: PathBuf::from(format!(r"D:\Diff\{name}.vhdx")),
+            parent_path: Some(PathBuf::from(format!(r"\\NAS\backup\{name}.vhdx"))),
+            volumes: vec![format!("{letter}:\\")],
+            kind: "差分盘".into(),
+            read_only: false,
+            can_eject: true,
+            warning: None,
+        }
+    }
+
+    #[test]
+    fn mounted_rows_render_separate_disks_and_parents() {
+        let ctx = egui::Context::default();
+        let mut app = DockApp::with_settings(AppConfig::default());
+        app.disks = vec![disk("F", "alpha"), disk("G", "beta")];
+        let output = ctx.run(input(vec![]), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.mount_page(ui));
+        });
+        let text = rendered_text(&output.shapes);
+        assert!(text.contains("F:\\"), "{text}");
+        assert!(text.contains("G:\\"), "{text}");
+        assert!(text.contains(r"D:\Diff\alpha.vhdx"), "{text}");
+        assert!(text.contains(r"\\NAS\backup\beta.vhdx"), "{text}");
+    }
+
+    #[test]
+    fn eject_confirmation_enter_cancels_without_starting_unmount() {
+        let ctx = egui::Context::default();
+        let mut app = DockApp::with_settings(AppConfig::default());
+        app.eject = Some(EjectConfirmation {
+            image: disk("F", "alpha"),
+            focus_cancel: true,
+        });
+        let _ = ctx.run(input(vec![]), |ctx| app.dialogs(ctx));
+        assert!(ctx.memory(|memory| memory.focused()).is_some());
+        let _ = ctx.run(
+            input(vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }]),
+            |ctx| app.dialogs(ctx),
+        );
+        assert!(
+            app.eject.is_none(),
+            "Enter should activate the default Cancel button"
+        );
+        assert!(
+            app.disk_busy.is_none(),
+            "Cancel must never start disk operations"
+        );
+    }
+
+    #[test]
+    fn builder_has_single_output_and_partial_explanation() {
+        let ctx = egui::Context::default();
+        let mut app = DockApp::with_settings(AppConfig::default());
+        let output = ctx.run(input(vec![]), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.build_page(ui));
+        });
+        let text = rendered_text(&output.shapes);
+        assert_eq!(text.matches("输出镜像").count(), 1, "{text}");
+        assert!(text.contains(".vhdx.partial"), "{text}");
+        assert!(!text.contains("本地临时目录"), "{text}");
+    }
+
+    #[test]
+    fn manual_diff_survives_base_changes_and_reload() {
+        let settings = AppConfig {
+            base_path: "first.vhdx".into(),
+            diff_path: "custom/work.vhdx".into(),
+            ..Default::default()
+        };
+        let mut app = DockApp::with_settings(settings);
+        assert!(app.diff_manual);
+        app.settings.base_path = "second.vhdx".into();
+        app.set_default_diff();
+        assert_eq!(app.settings.diff_path, "custom/work.vhdx");
+        app.diff_manual = false;
+        app.set_default_diff();
+        assert!(app.settings.diff_path.ends_with("second-diff.vhdx"));
+        let reloaded = DockApp::with_settings(app.settings);
+        assert!(
+            !reloaded.diff_manual,
+            "Automatically generated paths should remain automatic across restarts"
+        );
     }
 }
