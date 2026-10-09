@@ -27,7 +27,7 @@ Windows 便携式 VHDX 镜像制作与 VHD/VHDX 差分挂载工具。
 
 ## 获取与运行
 
-在 [Actions](https://github.com/tinymins/vhdxdock/actions) 的成功 Windows 构建中下载 `VhdxDock-windows-x64`，解压到本地可写目录，运行 `VhdxDock.exe`。
+在 [Releases](https://github.com/tinymins/vhdxdock/releases) 下载 Windows x64 预览版，或在 [Actions](https://github.com/tinymins/vhdxdock/actions) 的成功构建中下载 `VhdxDock-windows-x64`。解压到本地可写目录，运行 `VhdxDock.exe`。
 
 - Windows 10 / 11 x64；依赖系统内置 PowerShell 5.1、Storage 模块和 Robocopy。
 - 启动时请求管理员权限。取消授权后退出。

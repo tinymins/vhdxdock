@@ -83,7 +83,9 @@ mod tests {
             .decode(encode_script(input))
             .unwrap();
         let words: Vec<u16> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|v| u16::from_le_bytes([v[0], v[1]]))
             .collect();
         assert_eq!(String::from_utf16(&words).unwrap(), input);
