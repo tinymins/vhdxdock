@@ -8,6 +8,13 @@ license = "MIT"
 repository = "https://github.com/tinymins/vhdxdock"
 build = "build.rs"
 
+[features]
+ui-preview = ["dep:image"]
+
+[[example]]
+name = "ui_preview"
+required-features = ["ui-preview"]
+
 [dependencies]
 anyhow = "1"
 eframe = { version = "0.32.3", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
@@ -17,6 +24,7 @@ serde_json = "1"
 sha2 = "0.10"
 walkdir = "2"
 base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_Vhd", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading", "Win32_Security", "Win32_System_Ioctl", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

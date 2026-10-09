@@ -69,6 +69,8 @@ pub struct DockApp {
     relocation_focus_cancel: bool,
     config_dirty: bool,
     last_save: Instant,
+    #[cfg(feature = "ui-preview")]
+    preview_mode: bool,
 }
 
 impl DockApp {
@@ -126,7 +128,64 @@ impl DockApp {
             relocation_focus_cancel: false,
             config_dirty: false,
             last_save: Instant::now(),
+            #[cfg(feature = "ui-preview")]
+            preview_mode: false,
         }
+    }
+
+    /// Fixture-only constructor used by the opt-in screenshot example. It never
+    /// discovers disks, persists configuration or starts disk/logging workers.
+    #[cfg(feature = "ui-preview")]
+    #[allow(dead_code)] // Called by the separately compiled screenshot example.
+    pub fn preview(ctx: &egui::Context, scenario: &str) -> Self {
+        install_style(ctx);
+        let settings = AppConfig {
+            base_path: r"\\NAS\archives\JX3Code-base.vhdx".into(),
+            diff_path: r"D:\VhdxDock\JX3Code-base-diff.vhdx".into(),
+            source_path: r"E:\X\E".into(),
+            output_path: r"D:\Backup\JX3Code-base.vhdx".into(),
+            ..Default::default()
+        };
+        let mut app = Self::with_settings(settings);
+        app.preview_mode = true;
+        app.disks = vec![
+            MountedImage {
+                image_path: PathBuf::from(r"D:\VhdxDock\JX3Code-base-diff.vhdx"),
+                parent_path: Some(PathBuf::from(r"\\NAS\archives\JX3Code-base.vhdx")),
+                volumes: vec![r"F:\".into()],
+                kind: "差分 VHDX".into(),
+                read_only: false,
+                can_eject: true,
+                warning: None,
+            },
+            MountedImage {
+                image_path: PathBuf::from(r"D:\VhdxDock\Toolchain-diff.vhd"),
+                parent_path: Some(PathBuf::from(r"\\NAS\archives\Toolchain.vhd")),
+                volumes: vec![r"G:\".into()],
+                kind: "差分 VHD".into(),
+                read_only: false,
+                can_eject: true,
+                warning: None,
+            },
+        ];
+        if scenario == "build" {
+            app.tab = Tab::Build;
+        }
+        if scenario == "eject" {
+            app.eject = Some(EjectConfirmation {
+                image: app.disks[0].clone(),
+                focus_cancel: true,
+            });
+        }
+        app
+    }
+
+    fn operations_allowed(&self) -> bool {
+        #[cfg(feature = "ui-preview")]
+        if self.preview_mode {
+            return false;
+        }
+        true
     }
 
     fn log(&mut self, message: impl Into<String>) {
@@ -147,6 +206,9 @@ impl DockApp {
     }
 
     fn save(&mut self) {
+        if !self.operations_allowed() {
+            return;
+        }
         if let Err(error) = self.settings.save() {
             self.log(format!("配置保存失败：{error:#}"));
         }
@@ -178,6 +240,9 @@ impl DockApp {
     }
 
     fn refresh(&mut self) {
+        if !self.operations_allowed() {
+            return;
+        }
         if self.disk_busy.is_some() {
             return;
         }
@@ -193,6 +258,9 @@ impl DockApp {
     }
 
     fn mount(&mut self) {
+        if !self.operations_allowed() {
+            return;
+        }
         let request = match (
             Self::resolved(&self.settings.base_path),
             Self::resolved(&self.settings.diff_path),
@@ -221,6 +289,9 @@ impl DockApp {
     }
 
     fn unmount(&mut self, path: PathBuf) {
+        if !self.operations_allowed() {
+            return;
+        }
         self.disk_busy = Some("正在卸载镜像".into());
         self.notice = None;
         let tx = self.tx.clone();
@@ -236,6 +307,9 @@ impl DockApp {
     }
 
     fn relocate(&mut self) {
+        if !self.operations_allowed() {
+            return;
+        }
         let (diff, base) = match (
             Self::resolved(&self.relocate_diff),
             Self::resolved(&self.relocate_base),
@@ -260,6 +334,9 @@ impl DockApp {
     }
 
     fn start_build(&mut self) {
+        if !self.operations_allowed() {
+            return;
+        }
         let request = match (
             Self::resolved(&self.settings.source_path),
             Self::resolved(&self.settings.output_path),
@@ -368,6 +445,9 @@ impl DockApp {
     }
 
     fn open_path(&self, path: String) {
+        if !self.operations_allowed() {
+            return;
+        }
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             #[cfg(windows)]
@@ -410,7 +490,7 @@ impl DockApp {
                         TEXT
                     }))
                     .fill(if selected { ACCENT } else { Color32::WHITE })
-                    .stroke(Stroke::new(1.0, if selected { ACCENT } else { BORDER }))
+                    .stroke(Stroke::new(1.0_f32, if selected { ACCENT } else { BORDER }))
                     .min_size(Vec2::new(124.0, 38.0))
                     .corner_radius(7.0);
                 if ui.add(button).clicked() {
@@ -1190,7 +1270,7 @@ fn start_log_writer() -> mpsc::Sender<String> {
 fn card(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
         .fill(Color32::WHITE)
-        .stroke(Stroke::new(1.0, BORDER))
+        .stroke(Stroke::new(1.0_f32, BORDER))
         .corner_radius(10.0)
         .inner_margin(18)
         .show(ui, |ui| {
@@ -1283,7 +1363,7 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, enabled: bool, tooltip: &str) -> e
         let painter = ui.painter();
         let center = rect.center();
         let point = |x: f32, y: f32| center + Vec2::new(x, y);
-        let stroke = Stroke::new(1.7, color);
+        let stroke = Stroke::new(1.7_f32, color);
         match icon {
             Icon::Folder => {
                 painter.add(egui::Shape::closed_line(
@@ -1331,7 +1411,7 @@ fn brand_icon(ui: &mut egui::Ui) {
         ];
         ui.painter().add(egui::Shape::closed_line(
             points,
-            Stroke::new(1.6, Color32::WHITE),
+            Stroke::new(1.6_f32, Color32::WHITE),
         ));
     }
 }
@@ -1371,9 +1451,9 @@ fn install_style(ctx: &egui::Context) {
     style.visuals = egui::Visuals::light();
     style.visuals.override_text_color = Some(TEXT);
     style.visuals.selection.bg_fill = Color32::from_rgb(199, 231, 229);
-    style.visuals.selection.stroke = Stroke::new(1.0, ACCENT);
+    style.visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT);
     style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(247, 249, 251);
-    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
+    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
     style.spacing.item_spacing = Vec2::new(8.0, 7.0);
     style.spacing.button_padding = Vec2::new(12.0, 7.0);
     style

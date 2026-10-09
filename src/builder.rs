@@ -265,6 +265,46 @@ fn ensure_absent(path: &Path) -> Result<()> {
     }
 }
 
+// Resolve existing junction/symlink ancestors without creating directories.
+fn directory_scope_path(path: &Path) -> Result<PathBuf> {
+    let mut existing = crate::paths::resolve(path)?;
+    let mut missing = Vec::new();
+    loop {
+        match fs::canonicalize(&existing) {
+            Ok(mut resolved) => {
+                for part in missing.iter().rev() {
+                    resolved.push(part);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(
+                    existing
+                        .file_name()
+                        .context("日志路径没有可访问的父目录")?
+                        .to_os_string(),
+                );
+                if !existing.pop() {
+                    bail!("日志路径没有可访问的父目录");
+                }
+            }
+            Err(error) => return Err(error).context("无法验证日志目录位置"),
+        }
+    }
+}
+
+fn choose_log_directory(source: &Path, preferred: &Path, fallback: &Path) -> Result<PathBuf> {
+    let preferred = directory_scope_path(preferred)?;
+    if !output_inside_source(source, &preferred) {
+        return Ok(preferred);
+    }
+    let fallback = directory_scope_path(fallback)?;
+    if output_inside_source(source, &fallback) {
+        bail!("日志目录和临时备用日志目录都位于源文件夹内部；请修改源目录范围或 TEMP 环境变量。尚未创建镜像。");
+    }
+    Ok(fallback)
+}
+
 #[cfg(windows)]
 fn available_bytes(directory: &Path) -> Result<u64> {
     use std::os::windows::ffi::OsStrExt;
@@ -274,6 +314,30 @@ fn available_bytes(directory: &Path) -> Result<u64> {
     unsafe { GetDiskFreeSpaceExW(PCWSTR(wide.as_ptr()), Some(&mut available), None, None) }
         .context("无法查询输出位置剩余空间")?;
     Ok(available)
+}
+
+#[cfg(windows)]
+struct RobocopyWorker {
+    child: std::process::Child,
+    finished: bool,
+}
+#[cfg(windows)]
+impl RobocopyWorker {
+    fn stop(&mut self) -> Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        let _ = self.child.kill();
+        self.child.wait().context("无法等待 Robocopy 停止")?;
+        self.finished = true;
+        Ok(())
+    }
+}
+#[cfg(windows)]
+impl Drop for RobocopyWorker {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
 }
 
 #[cfg(windows)]
@@ -316,7 +380,10 @@ fn run_robocopy(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .creation_flags(0x08000000);
-    let mut child = cmd.spawn().context("无法启动 Windows Robocopy")?;
+    let mut worker = RobocopyWorker {
+        child: cmd.spawn().context("无法启动 Windows Robocopy")?,
+        finished: false,
+    };
     let phase = if verify {
         "文件信息校验"
     } else {
@@ -325,11 +392,17 @@ fn run_robocopy(
     let mut last = std::time::Instant::now();
     loop {
         if cancel.load(Ordering::Relaxed) {
-            let _ = child.kill();
-            let _ = child.wait();
+            worker.stop()?;
             check_cancel(cancel)?;
         }
-        if let Some(status) = child.try_wait()? {
+        // If polling errors or a callback panics, the worker guard stops and
+        // reaps Robocopy before the caller attempts to detach its image.
+        if let Some(status) = worker
+            .child
+            .try_wait()
+            .context("查询 Robocopy 进程状态失败")?
+        {
+            worker.finished = true;
             let code = status.code().context("Robocopy 未返回正常退出码")?;
             if !(if verify {
                 verify_exit_ok(code)
@@ -456,6 +529,14 @@ fn build_windows(
     for path in [&output, &partial, &checksum] {
         ensure_absent(path)?;
     }
+    // Resolve/create logging before the source manifest: probing the portable
+    // config directory may touch a directory inside the selected source.
+    let log_dir = choose_log_directory(
+        &source,
+        &crate::config::data_dir().join("logs"),
+        &std::env::temp_dir().join("VhdxDockLogs"),
+    )?;
+    fs::create_dir_all(&log_dir)?;
     progress(Progress {
         phase: "扫描".into(),
         message: "正在统计源目录，链接不会被展开".into(),
@@ -480,8 +561,6 @@ fn build_windows(
             free_bytes as f64 / 1073741824.0
         );
     }
-    let log_dir = crate::config::data_dir().join("logs");
-    fs::create_dir_all(&log_dir)?;
     let id = format!(
         "build-{}-{}",
         SystemTime::now()
@@ -594,18 +673,26 @@ fn build_windows(
     fs::set_permissions(&partial, permissions)?;
     // MoveFileW fails if the destination appeared while the worker was running.
     rename_no_replace(&partial, &output)?;
-    let mut hash_output = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&checksum)
-        .context("镜像制作完成，但无法写入 SHA-256 文件")?;
-    writeln!(
-        hash_output,
-        "{}  {}",
-        digest,
-        output.file_name().context("缺少文件名")?.to_string_lossy()
-    )?;
-    hash_output.sync_all()?;
+    let save_checksum = (|| -> Result<()> {
+        let mut hash_output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&checksum)?;
+        writeln!(
+            hash_output,
+            "{}  {}",
+            digest,
+            output.file_name().context("缺少文件名")?.to_string_lossy()
+        )?;
+        hash_output.sync_all()?;
+        Ok(())
+    })();
+    save_checksum.with_context(|| {
+        format!(
+            "完整镜像已保存在 {}，但无法写入 SHA-256 文件；无需重新制作镜像",
+            output.display()
+        )
+    })?;
     writeln!(
         summary,
         "Completed: {}\nSHA-256: {}",
@@ -677,6 +764,32 @@ mod tests {
         fs::write(&path, b"existing").unwrap();
         assert!(ensure_absent(&path).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"existing");
+    }
+    #[test]
+    fn logging_falls_back_without_creating_inside_source() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let preferred = source.join("tool/logs");
+        let fallback = root.path().join("temporary/VhdxDockLogs");
+        assert_eq!(
+            choose_log_directory(&source, &preferred, &fallback).unwrap(),
+            directory_scope_path(&fallback).unwrap()
+        );
+        assert!(!preferred.exists());
+        assert!(!fallback.exists());
+        assert!(choose_log_directory(&source, &preferred, &source.join("temp/logs")).is_err());
+    }
+    #[test]
+    fn logging_uses_preferred_when_outside_source() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let preferred = root.path().join("tool/logs");
+        assert_eq!(
+            choose_log_directory(&source, &preferred, &source.join("unused")).unwrap(),
+            directory_scope_path(&preferred).unwrap()
+        );
     }
     #[test]
     fn manifest_comparison_rejects_missing_and_extra_files() {
