@@ -1,0 +1,9 @@
+/target/
+/dist/
+/logs/
+/config.json
+*.vhd
+*.vhdx
+*.partial
+*.sha256
+

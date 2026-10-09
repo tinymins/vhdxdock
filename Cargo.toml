@@ -1,0 +1,33 @@
+[package]
+name = "vhdxdock"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Windows VHDX image builder and NAS-backed differencing disk manager"
+license = "MIT"
+repository = "https://github.com/tinymins/vhdxdock"
+build = "build.rs"
+
+[dependencies]
+anyhow = "1"
+eframe = { version = "0.32.3", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+walkdir = "2"
+base64 = "0.22"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_Vhd", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading", "Win32_Security", "Win32_System_Ioctl"] }
+
+[build-dependencies]
+winresource = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
+
