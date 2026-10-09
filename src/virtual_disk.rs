@@ -35,6 +35,10 @@ pub fn physical_path(_: &Path) -> Result<String> {
     unsupported()
 }
 #[cfg(not(windows))]
+pub fn canonical_physical_device(_: &str) -> Result<String> {
+    unsupported()
+}
+#[cfg(not(windows))]
 pub fn relocate_parent(_: &Path, _: &Path) -> Result<()> {
     unsupported()
 }
@@ -73,11 +77,16 @@ mod native {
             Storage::{
                 FileSystem::{
                     CreateFileW, GetVolumeNameForVolumeMountPointW, FILE_ATTRIBUTE_NORMAL,
-                    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+                    FILE_DEVICE_DISK, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
                 },
                 Vhd::*,
             },
-            System::{Ioctl::FSCTL_LOCK_VOLUME, IO::DeviceIoControl},
+            System::{
+                Ioctl::{
+                    FSCTL_LOCK_VOLUME, IOCTL_STORAGE_GET_DEVICE_NUMBER, STORAGE_DEVICE_NUMBER,
+                },
+                IO::DeviceIoControl,
+            },
         },
     };
 
@@ -484,6 +493,50 @@ mod native {
     }
     pub fn physical_path(path: &Path) -> Result<String> {
         physical(&open(path, false, false)?)
+    }
+    /// GetAllAttachedVirtualDiskPhysicalPaths may enumerate device-interface
+    /// names. Resolve the actual device number rather than parsing that name.
+    pub fn canonical_physical_device(device: &str) -> Result<String> {
+        let p = wide(Path::new(device))?;
+        let handle = Handle(unsafe {
+            CreateFileW(
+                PCWSTR(p.as_ptr()),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+            .context("打开枚举的虚拟磁盘设备")?
+        });
+        let mut number = STORAGE_DEVICE_NUMBER::default();
+        let mut returned = 0;
+        unsafe {
+            DeviceIoControl(
+                handle.0,
+                IOCTL_STORAGE_GET_DEVICE_NUMBER,
+                None,
+                0,
+                Some(std::ptr::addr_of_mut!(number).cast()),
+                size_of::<STORAGE_DEVICE_NUMBER>() as u32,
+                Some(&mut returned),
+                None,
+            )
+            .context("查询枚举设备的真实磁盘编号")?;
+        }
+        if returned as usize != size_of::<STORAGE_DEVICE_NUMBER>()
+            || number.DeviceType != FILE_DEVICE_DISK.0
+            || !matches!(number.PartitionNumber, 0 | u32::MAX)
+        {
+            bail!(
+                "枚举设备未返回完整的整盘磁盘标识：类型 {}，分区 {}，返回字节 {}",
+                number.DeviceType,
+                number.PartitionNumber,
+                returned
+            )
+        }
+        Ok(format!(r"\\.\PhysicalDrive{}", number.DeviceNumber))
     }
     pub fn relocate_parent(diff: &Path, base: &Path) -> Result<()> {
         if inspect(diff)?.attached {

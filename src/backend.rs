@@ -46,7 +46,8 @@ foreach ($candidate in @($req.candidates)) {
     $volumes = @()
     $warning = $null
     try {
-        if ($physical -notmatch '^\\\\\.\\PhysicalDrive(\d+)$') { throw '无法识别物理设备名称' }
+        if ($candidate.normalizationError) { throw ('无法规范化枚举设备：' + $candidate.enumeratedPhysical + '；' + $candidate.normalizationError) }
+        if ($physical -notmatch '^\\\\\.\\PhysicalDrive(\d+)$') { throw ('无法识别物理设备名称：' + $physical) }
         $disk = Get-Disk -Number ([int]$Matches[1]) -ErrorAction Stop
         try {
             $diskImage = Get-DiskImage -DevicePath $physical -ErrorAction Stop
@@ -78,7 +79,7 @@ foreach ($candidate in @($req.candidates)) {
         }
         if ($protected) { $warning = '系统、启动或分页文件所在磁盘，禁止卸载' }
     } catch {
-        $warning = '无法验证磁盘安全状态：' + $_.Exception.Message
+        $warning = '无法验证磁盘安全状态：' + $_.Exception.Message + ' [' + $_.FullyQualifiedErrorId + '] ' + $_.InvocationInfo.PositionMessage
         $protected = $true
     }
     if (-not $image) { $image = $physical; $protected = $true; $warning = '无法查询基础文件路径，禁止卸载' }
@@ -92,7 +93,13 @@ ConvertTo-Json -InputObject @($rows) -Depth 5 -Compress
 
     pub fn list_mounted() -> Result<Vec<MountedImage>> {
         let candidates = virtual_disk::attached_paths()?;
-        let payload = json!({"candidates": candidates.iter().map(|p| json!({"physical": p.physical, "image": p.image})).collect::<Vec<_>>()});
+        let payload = json!({"candidates": candidates.iter().map(|p| {
+            let (physical, error) = match virtual_disk::canonical_physical_device(&p.physical) {
+                Ok(device) => (device, None),
+                Err(error) => (p.physical.clone(), Some(format!("{error:#}"))),
+            };
+            json!({"physical": physical, "enumeratedPhysical":p.physical, "normalizationError":error, "image": p.image})
+        }).collect::<Vec<_>>()});
         let value = process::powershell(DISCOVER, &payload)?;
         let mut rows: Vec<MountedImage> =
             serde_json::from_value(value).context("Windows 返回的挂载列表无效")?;
@@ -256,8 +263,20 @@ ConvertTo-Json -InputObject $snapshot -Depth 7 -Compress
     }
     fn wait_for_mount_rows(diff: &Path) -> Result<Vec<MountedImage>> {
         let mut last = anyhow::anyhow!("Windows 尚未返回挂载状态");
+        let mut last_rows = serde_json::Value::Null;
         for attempt in 0..8 {
-            match list_mounted().and_then(|rows| verify_mount_rows(rows, diff)) {
+            let result = match list_mounted() {
+                Ok(rows) => {
+                    last_rows = serde_json::to_value(&rows)
+                        .unwrap_or_else(|error| json!({"snapshotError":error.to_string()}));
+                    verify_mount_rows(rows, diff)
+                }
+                Err(error) => {
+                    last_rows = json!({"listError":format!("{error:#}")});
+                    Err(error)
+                }
+            };
+            match result {
                 Ok(rows) => return Ok(rows),
                 Err(error) => last = error,
             }
@@ -270,8 +289,16 @@ ConvertTo-Json -InputObject $snapshot -Depth 7 -Compress
                 process::powershell(MOUNT_DIAGNOSTICS, &json!({"physical":physical}))
             })
             .unwrap_or_else(|error| json!({"diagnosticError":format!("{error:#}")}));
+        let enumerated = virtual_disk::attached_paths()
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|p| json!({"physical":p.physical,"image":p.image}))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         Err(last)
-            .with_context(|| format!("等待卷就绪后仍未通过挂载检查；实时存储快照：{diagnostic}"))
+            .with_context(|| format!("等待卷就绪后仍未通过挂载检查；最后挂载列表：{last_rows}；枚举设备：{}；实时存储快照：{diagnostic}",json!(enumerated)))
     }
     fn ensure_finalized(path: &Path) -> Result<()> {
         if path
@@ -290,14 +317,14 @@ ConvertTo-Json -InputObject $snapshot -Depth 7 -Compress
             .iter()
             .find(|r| paths::same_path(&r.image_path, diff))
             .context("Windows 未返回目标差分镜像的挂载记录")?;
+        if let Some(warning) = &row.warning {
+            bail!("差分镜像状态无法确认：{warning}")
+        }
         if row.volumes.is_empty() {
             bail!("差分镜像没有可打开的卷")
         }
         if row.read_only {
             bail!("差分镜像处于只读状态")
-        }
-        if let Some(warning) = &row.warning {
-            bail!("差分镜像状态无法确认：{warning}")
         }
         Ok(rows)
     }
@@ -537,7 +564,12 @@ function Get-Partition {
             assert!(verify_mount_rows(vec![unreadable], path).is_err());
             let mut ambiguous = row;
             ambiguous.warning = Some("无法验证磁盘状态".into());
-            assert!(verify_mount_rows(vec![ambiguous], path).is_err());
+            ambiguous.volumes.clear();
+            let error = verify_mount_rows(vec![ambiguous], path).unwrap_err();
+            assert!(
+                error.to_string().contains("无法验证磁盘状态"),
+                "an empty volume list must not hide the discovery failure"
+            );
         }
         #[test]
         fn powershell_worker_scripts_parse_without_execution() {
