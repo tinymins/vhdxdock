@@ -19,11 +19,13 @@ const ACCENT: Color32 = Color32::from_rgb(13, 115, 119);
 const TEXT: Color32 = Color32::from_rgb(30, 44, 60);
 const MUTED: Color32 = Color32::from_rgb(100, 116, 139);
 const BORDER: Color32 = Color32::from_rgb(221, 228, 235);
+const CARD_PADDING: i8 = 18;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Tab {
     Mount,
     Build,
+    Logs,
 }
 
 enum Event {
@@ -173,6 +175,19 @@ impl DockApp {
         ];
         if scenario == "build" {
             app.tab = Tab::Build;
+        }
+        if scenario == "logs" {
+            app.tab = Tab::Logs;
+            app.logs = [
+                "VhdxDock 已启动",
+                "已刷新挂载列表：2 个镜像",
+                r"基础镜像：\\NAS\archives\JX3Code-base.vhdx",
+                r"本地差分：D:\VhdxDock\JX3Code-base-diff.vhdx",
+                "镜像已挂载，修改将保存在差分盘中",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect();
         }
         if scenario == "eject" {
             app.eject = Some(EjectConfirmation {
@@ -510,21 +525,15 @@ impl DockApp {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             for (tab, title) in [(Tab::Mount, "挂载镜像"), (Tab::Build, "制作镜像")] {
-                let selected = self.tab == tab;
-                let button =
-                    egui::Button::new(RichText::new(title).size(15.0).color(if selected {
-                        Color32::WHITE
-                    } else {
-                        TEXT
-                    }))
-                    .fill(if selected { ACCENT } else { Color32::WHITE })
-                    .stroke(Stroke::new(1.0_f32, if selected { ACCENT } else { BORDER }))
-                    .min_size(Vec2::new(124.0, 38.0))
-                    .corner_radius(7.0);
-                if ui.add(button).clicked() {
+                if tab_button(ui, title, self.tab == tab).clicked() {
                     self.tab = tab;
                 }
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if tab_button(ui, "日志", self.tab == Tab::Logs).clicked() {
+                    self.tab = Tab::Logs;
+                }
+            });
         });
         ui.add_space(18.0);
     }
@@ -623,6 +632,69 @@ impl DockApp {
         });
         ui.add_space(14.0);
         self.mounted_list(ui);
+    }
+
+    fn logs_page(&mut self, ui: &mut egui::Ui) {
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("操作日志").strong().size(17.0));
+                ui.label(RichText::new(format!("{} 条", self.logs.len())).color(MUTED));
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.small_button("清空显示").clicked() {
+                    self.logs.clear();
+                }
+                if ui.small_button("打开日志目录").clicked() {
+                    self.open_path(config::data_dir().join("logs").display().to_string());
+                }
+            });
+            ui.add_space(8.0);
+            let footer = "清空显示仅清除当前列表，磁盘日志文件保留。";
+            let footer_height = ui
+                .painter()
+                .layout_no_wrap(footer.into(), egui::FontId::proportional(12.0), MUTED)
+                .rect
+                .height();
+            let notice_space = self.notice.as_ref().map_or(0.0, |(message, _)| {
+                let height = ui
+                    .painter()
+                    .layout(
+                        message.clone(),
+                        egui::TextStyle::Body.resolve(ui.style()),
+                        TEXT,
+                        ui.available_width(),
+                    )
+                    .rect
+                    .height();
+                height + 24.0 + 12.0 + ui.spacing().item_spacing.y
+            });
+            let footer_space = footer_height
+                + 8.0
+                + 2.0 * ui.spacing().item_spacing.y
+                + f32::from(CARD_PADDING)
+                + 1.0;
+            let list_height =
+                (ui.clip_rect().bottom() - ui.cursor().top() - footer_space - notice_space)
+                    .max(0.0);
+            egui::ScrollArea::vertical()
+                .id_salt("logs_page_list")
+                .min_scrolled_height(0.0)
+                .max_height(list_height)
+                .auto_shrink([false, false])
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    if self.logs.is_empty() {
+                        ui.label(RichText::new("暂无操作日志").color(MUTED));
+                    } else {
+                        for message in &self.logs {
+                            ui.label(RichText::new(message).size(12.0).color(MUTED));
+                        }
+                    }
+                });
+            ui.add_space(8.0);
+            ui.label(RichText::new(footer).size(12.0).color(MUTED));
+        });
     }
 
     fn mounted_list(&mut self, ui: &mut egui::Ui) {
@@ -1187,11 +1259,17 @@ impl eframe::App for DockApp {
             .show(ctx, |ui| {
                 self.header(ui);
                 egui::ScrollArea::vertical()
+                    .id_salt(match self.tab {
+                        Tab::Mount => "mount_page_scroll",
+                        Tab::Build => "build_page_scroll",
+                        Tab::Logs => "logs_page_scroll",
+                    })
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         match self.tab {
                             Tab::Mount => self.mount_page(ui),
                             Tab::Build => self.build_page(ui),
+                            Tab::Logs => self.logs_page(ui),
                         }
                         if let Some((message, error)) = &self.notice {
                             ui.add_space(12.0);
@@ -1211,31 +1289,6 @@ impl eframe::App for DockApp {
                                     }));
                                 });
                         }
-                        ui.add_space(12.0);
-                        egui::CollapsingHeader::new(format!("操作日志  ·  {} 条", self.logs.len()))
-                            .id_salt("operation_log")
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    if ui.small_button("清空显示").clicked() {
-                                        self.logs.clear();
-                                    }
-                                    if ui.small_button("打开日志目录").clicked() {
-                                        self.open_path(
-                                            config::data_dir().join("logs").display().to_string(),
-                                        );
-                                    }
-                                });
-                                egui::ScrollArea::vertical()
-                                    .max_height(180.0)
-                                    .stick_to_bottom(true)
-                                    .show(ui, |ui| {
-                                        for message in &self.logs {
-                                            ui.label(
-                                                RichText::new(message).size(12.0).color(MUTED),
-                                            );
-                                        }
-                                    });
-                            });
                     });
             });
         self.dialogs(ctx);
@@ -1256,6 +1309,20 @@ fn primary(label: &str, width: f32) -> egui::Button<'_> {
         .fill(ACCENT)
         .min_size(Vec2::new(width, 36.0))
         .corner_radius(6.0)
+}
+
+fn tab_button(ui: &mut egui::Ui, title: &str, selected: bool) -> egui::Response {
+    ui.add(
+        egui::Button::new(RichText::new(title).size(15.0).color(if selected {
+            Color32::WHITE
+        } else {
+            TEXT
+        }))
+        .fill(if selected { ACCENT } else { Color32::WHITE })
+        .stroke(Stroke::new(1.0_f32, if selected { ACCENT } else { BORDER }))
+        .min_size(Vec2::new(124.0, 38.0))
+        .corner_radius(7.0),
+    )
 }
 
 fn start_log_writer() -> mpsc::Sender<LogCommand> {
@@ -1309,7 +1376,7 @@ fn card(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
         .fill(Color32::WHITE)
         .stroke(Stroke::new(1.0_f32, BORDER))
         .corner_radius(10.0)
-        .inner_margin(18)
+        .inner_margin(CARD_PADDING)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             content(ui);
@@ -1540,6 +1607,173 @@ mod tests {
             collect(&shape.shape, &mut text);
         }
         text
+    }
+
+    fn text_rect(shapes: &[egui::epaint::ClippedShape], text: &str) -> egui::Rect {
+        shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(shape) if shape.galley.job.text == text => Some(
+                    egui::Rect::from_min_size(shape.pos, shape.galley.rect.size()),
+                ),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("Missing UI label: {text}"))
+    }
+
+    fn pointer_events(position: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(position),
+            egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            },
+        ]
+    }
+
+    fn draw_header(
+        ctx: &egui::Context,
+        app: &mut DockApp,
+        width: f32,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let mut raw = input(events);
+        raw.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            Vec2::new(width, 760.0),
+        ));
+        ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.header(ui));
+        })
+    }
+
+    #[test]
+    fn logs_tab_is_right_aligned_and_real_clicks_preserve_tasks() {
+        for width in [1100.0, 1280.0] {
+            let ctx = egui::Context::default();
+            let mut app = DockApp::with_settings(AppConfig::default());
+            app.building = true;
+            app.disk_busy = Some("正在挂载".into());
+            app.notice = Some(("已有提示".into(), true));
+            app.logs.push_back("已有日志".into());
+            let cancel = app.cancel.clone();
+            let output = draw_header(&ctx, &mut app, width, vec![]);
+            let mount = text_rect(&output.shapes, "挂载镜像");
+            let build = text_rect(&output.shapes, "制作镜像");
+            let logs = text_rect(&output.shapes, "日志");
+            assert!((mount.center().y - logs.center().y).abs() < 1.0);
+            assert!((build.center().y - logs.center().y).abs() < 1.0);
+            assert!(
+                logs.center().x > width - 100.0,
+                "Logs must sit at the right edge"
+            );
+            assert!(mount.right() < build.left() && build.right() < logs.left());
+            for (target, rect) in [(Tab::Logs, logs), (Tab::Build, build), (Tab::Mount, mount)] {
+                let _ = draw_header(&ctx, &mut app, width, pointer_events(rect.center(), true));
+                let _ = draw_header(&ctx, &mut app, width, pointer_events(rect.center(), false));
+                assert_eq!(app.tab, target);
+            }
+            assert!(app.building);
+            assert_eq!(app.disk_busy.as_deref(), Some("正在挂载"));
+            assert_eq!(app.notice, Some(("已有提示".into(), true)));
+            assert!(Arc::ptr_eq(&cancel, &app.cancel));
+            assert!(!app.cancel.load(Ordering::Relaxed));
+            assert_eq!(app.logs.len(), 1);
+        }
+    }
+
+    #[test]
+    fn logs_page_clear_only_changes_memory_and_keeps_logger_untouched() {
+        let ctx = egui::Context::default();
+        let mut app = DockApp::with_settings(AppConfig::default());
+        app.tab = Tab::Logs;
+        app.logs.push_back("测试会话日志内容".into());
+        let (writer, commands) = mpsc::channel();
+        app.log_tx = Some(writer);
+        let render = |app: &mut DockApp, events| {
+            ctx.run(input(events), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.logs_page(ui));
+            })
+        };
+        let output = render(&mut app, vec![]);
+        let text = rendered_text(&output.shapes);
+        assert!(text.contains("测试会话日志内容"));
+        assert!(text.contains("打开日志目录"));
+        assert!(text.contains("磁盘日志文件保留"));
+        let clear = text_rect(&output.shapes, "清空显示").center();
+        let _ = render(&mut app, pointer_events(clear, true));
+        let output = render(&mut app, pointer_events(clear, false));
+        assert!(app.logs.is_empty());
+        assert!(rendered_text(&output.shapes).contains("暂无操作日志"));
+        assert!(
+            matches!(commands.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "Clearing the displayed list must not send disk logger operations"
+        );
+    }
+
+    #[test]
+    fn logs_footer_and_notice_stay_inside_the_visible_page() {
+        for height in [600.0, 760.0, 820.0] {
+            for show_notice in [false, true] {
+                let ctx = egui::Context::default();
+                install_style(&ctx);
+                let mut app = DockApp::with_settings(AppConfig::default());
+                app.tab = Tab::Logs;
+                app.logs = (0..100).map(|index| format!("操作日志 {index}")).collect();
+                let message = "已有错误提示，请检查镜像路径后重试。".repeat(8);
+                if show_notice {
+                    app.notice = Some((message.clone(), true));
+                }
+                let mut raw = input(vec![]);
+                raw.screen_rect = Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1100.0, height),
+                ));
+                let output = ctx.run(raw, |ctx| {
+                    egui::TopBottomPanel::bottom("test_status")
+                        .exact_height(34.0)
+                        .show(ctx, |_| {});
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::new().inner_margin(24))
+                        .show(ctx, |ui| {
+                            app.header(ui);
+                            egui::ScrollArea::vertical()
+                                .id_salt("test_logs_container")
+                                .show(ui, |ui| {
+                                    app.logs_page(ui);
+                                    if let Some((message, _)) = &app.notice {
+                                        ui.add_space(12.0);
+                                        egui::Frame::new().inner_margin(12).show(ui, |ui| {
+                                            ui.label(message);
+                                        });
+                                    }
+                                });
+                        });
+                });
+                let assert_visible = |text: &str| {
+                    let (shape, clip) = output
+                        .shapes
+                        .iter()
+                        .find_map(|clipped| match &clipped.shape {
+                            egui::Shape::Text(shape) if shape.galley.job.text == text => {
+                                Some((shape, clipped.clip_rect))
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| panic!("Expected visible text: {text}"));
+                    assert!(
+                        shape.pos.y + shape.galley.rect.max.y <= clip.bottom(),
+                        "Text clipped at height {height}, notice={show_notice}: {text}"
+                    );
+                };
+                assert_visible("清空显示仅清除当前列表，磁盘日志文件保留。");
+                if show_notice {
+                    assert_visible(&message);
+                }
+            }
+        }
     }
 
     fn disk(letter: &str, name: &str) -> MountedImage {

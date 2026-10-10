@@ -2,7 +2,7 @@
 //! created, attached or detached. Only this example's egui framebuffer is saved.
 //!
 //! cargo run --features ui-preview --example ui_preview -- mount D:\QA\mount.png
-//! Scenarios: mount, build, eject.
+//! Scenarios: mount, build, eject, logs.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 #[allow(dead_code)]

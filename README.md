@@ -13,6 +13,7 @@ Windows 便携式 VHDX 镜像制作与 VHD/VHDX 差分挂载工具。
 ![挂载与多磁盘管理](docs/screenshots/mount.png)
 ![制作镜像](docs/screenshots/build.png)
 ![卸载二次确认](docs/screenshots/eject.png)
+![日志页签](docs/screenshots/logs.png)
 
 ## 功能
 
@@ -24,6 +25,7 @@ Windows 便携式 VHDX 镜像制作与 VHD/VHDX 差分挂载工具。
 - **压缩**：GPT + NTFS，默认开启镜像内部 NTFS 压缩。
 - **校验**：默认文件信息比较，可选逐文件 SHA-256；完成后额外生成整个镜像的 `.sha256` 文件。
 - **后台任务**：制作、扫描、校验和磁盘操作不会阻塞界面，支持取消制作、查看日志和记忆配置。
+- **日志**：与“挂载镜像”“制作镜像”同排、靠右的“日志”页签，切换查看操作记录。
 
 ## 获取与运行
 
@@ -87,6 +89,8 @@ Get-FileHash -LiteralPath 'D:\Backup\XE-base.vhdx' -Algorithm SHA256
 ## 配置与日志
 
 优先保存到 exe 目录的 `config.json` 和 `logs/`；目录不可写时使用用户应用数据目录。制作日志包含扫描结果、链接、复制、复查和最终校验信息。不会在日志中保存 NAS 密码。
+
+点击顶部最右侧的 **日志** 页签查看本次会话记录，可以清空显示或打开日志目录。清空显示不会删除磁盘上的日志文件；切换页签不影响正在进行的后台任务。
 
 ## 从源码构建
 
