@@ -219,7 +219,7 @@ fn mount_scratch(
     }
 }
 
-fn scenario(verify: VerifyMode, compress: bool) -> Result<()> {
+fn scenario(verify: VerifyMode, compress: bool, volume_label: &str) -> Result<()> {
     require_explicit_permission_and_admin()?;
     let _serial = BUILDER_TEST_LOCK
         .lock()
@@ -249,6 +249,19 @@ ConvertTo-Json -InputObject @{ok=$true} -Compress
         &json!({"paths": [source.join(".git"), source.join("hidden.dat")]}),
     )?;
     let base = output_dir.join("镜像 ' $ base.vhdx");
+    let expected_label = if volume_label.is_empty() {
+        base.file_stem()
+            .context("base filename stem")?
+            .to_str()
+            .context("UTF-8 test fixture filename")?
+            .to_owned()
+    } else {
+        volume_label.to_owned()
+    };
+    ensure!(
+        expected_label.encode_utf16().count() <= 32,
+        "test fixture volume label exceeds NTFS limit"
+    );
     let partial = paths::partial_path(&base);
     let diff = output_dir.join("镜像 ' $ base-diff.vhdx");
     scratch.track(base.clone());
@@ -263,6 +276,7 @@ ConvertTo-Json -InputObject @{ok=$true} -Compress
             capacity_gib: 1,
             compress,
             verify,
+            volume_label: volume_label.to_owned(),
         },
         Arc::new(AtomicBool::new(false)),
         move |progress| {
@@ -332,6 +346,29 @@ ConvertTo-Json -InputObject @{ok=$true} -Compress
         "creating/mounting scratch differencing disk failed",
     )?;
     let root = mounted_volume(&rows, &diff)?;
+    // Query only partitions belonging to this fixture's newly mounted diff.
+    // It inherits the NTFS label written into the sealed base image.
+    let labels = process::powershell(
+        r#"
+if ([string]$req.physical -notmatch '^\\\\\.\\PhysicalDrive(\d+)$') { throw 'Invalid scratch physical-device path' }
+$number = [int]$Matches[1]
+$labels = @(Get-Partition -DiskNumber $number -ErrorAction Stop | Get-Volume -ErrorAction SilentlyContinue | ForEach-Object { [string]$_.FileSystemLabel })
+ConvertTo-Json -InputObject @($labels) -Compress
+"#,
+        &json!({"physical": virtual_disk::physical_path(&diff)?}),
+    ).context("querying inherited scratch NTFS volume label failed")?;
+    let labels = labels
+        .as_array()
+        .context("volume-label query must return an array")?;
+    ensure!(
+        labels.len() == 1,
+        "expected one scratch NTFS volume, got {labels:?}"
+    );
+    ensure!(
+        labels[0].as_str() == Some(expected_label.as_str()),
+        "inherited volume label mismatch: expected {expected_label:?}, got {:?}",
+        labels[0]
+    );
     ensure!(
         fs::read(root.join(chinese_file))? == contents,
         "source content was not copied flat to image root"
@@ -394,11 +431,11 @@ ConvertTo-Json -InputObject @{ok=$true} -Compress
 #[test]
 #[ignore = "Requires explicit VHDXDOCK_RUN_DISK_TESTS=1 and elevated Windows; formats dedicated scratch VHDX files only"]
 fn metadata_builder_flat_copy_and_persistent_overlay() -> Result<()> {
-    scenario(VerifyMode::Metadata, false)
+    scenario(VerifyMode::Metadata, false, "剑三 ' $ 归档")
 }
 
 #[test]
 #[ignore = "Requires explicit VHDXDOCK_RUN_DISK_TESTS=1 and elevated Windows; formats dedicated scratch VHDX files only"]
 fn sha256_compressed_builder_flat_copy_and_persistent_overlay() -> Result<()> {
-    scenario(VerifyMode::Sha256, true)
+    scenario(VerifyMode::Sha256, true, "")
 }

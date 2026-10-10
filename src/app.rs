@@ -346,22 +346,28 @@ impl DockApp {
         });
     }
 
+    fn build_request(&self) -> Result<BuildRequest, String> {
+        let source = Self::resolved(&self.settings.source_path)?;
+        let output = Self::resolved(&self.settings.output_path)?;
+        let volume_label = builder::resolve_volume_label(&output, &self.settings.volume_label)
+            .map_err(|error| format!("{error:#}"))?;
+        Ok(BuildRequest {
+            source,
+            output,
+            volume_label,
+            capacity_gib: self.settings.capacity_gib,
+            compress: self.settings.compress,
+            verify: self.settings.verify,
+        })
+    }
+
     fn start_build(&mut self) {
         if !self.operations_allowed() || self.exit_when_idle {
             return;
         }
-        let request = match (
-            Self::resolved(&self.settings.source_path),
-            Self::resolved(&self.settings.output_path),
-        ) {
-            (Ok(source), Ok(output)) => BuildRequest {
-                source,
-                output,
-                capacity_gib: self.settings.capacity_gib,
-                compress: self.settings.compress,
-                verify: self.settings.verify,
-            },
-            (Err(error), _) | (_, Err(error)) => {
+        let request = match self.build_request() {
+            Ok(request) => request,
+            Err(error) => {
                 self.report(error, true);
                 return;
             }
@@ -832,17 +838,58 @@ impl DockApp {
                 );
                 ui.label(
                     RichText::new(
-                        "制作中使用同目录的 .vhdx.partial；完成校验并卸载后去掉 .partial。",
+                        "全程写入指定位置，不占用软件所在盘；制作中为 .vhdx.partial，校验卸载后去掉 .partial。",
                     )
                     .size(12.0)
                     .color(MUTED),
                 );
-                ui.label(
-                    RichText::new("镜像全程写入指定位置，不占用软件所在盘存放镜像。")
-                        .size(12.0)
-                        .color(MUTED),
-                );
-                ui.add_space(14.0);
+                ui.add_space(10.0);
+                ui.label(RichText::new("卷标").strong().size(13.0));
+                self.config_dirty |= ui
+                    .add_sized(
+                        [ui.available_width(), 34.0],
+                        egui::TextEdit::singleline(&mut self.settings.volume_label)
+                            .hint_text("留空使用输出镜像文件名（去掉 .vhdx）"),
+                    )
+                    .changed();
+                ui.horizontal_wrapped(|ui| {
+                    if !self.settings.output_path.trim().is_empty()
+                        || !self.settings.volume_label.is_empty()
+                    {
+                        match builder::resolve_volume_label(
+                            Path::new(self.settings.output_path.trim()),
+                            &self.settings.volume_label,
+                        ) {
+                            Ok(label) => {
+                                ui.label(
+                                    RichText::new(format!("实际卷标：{label}"))
+                                        .size(12.0)
+                                        .color(MUTED),
+                                );
+                            }
+                            Err(error) => {
+                                ui.label(
+                                    RichText::new(error.to_string())
+                                        .size(12.0)
+                                        .color(Color32::from_rgb(164, 46, 41)),
+                                );
+                            }
+                        }
+                    } else {
+                        ui.label(
+                            RichText::new("挂载后在资源管理器中显示的磁盘名称。")
+                                .size(12.0)
+                                .color(MUTED),
+                        );
+                    }
+                    ui.label(
+                        RichText::new("最多 32 个 UTF-16 字符")
+                            .size(12.0)
+                            .color(MUTED),
+                    )
+                    .on_hover_text("大多数汉字和字母计为 1 个；部分符号（如 emoji）计为 2 个。");
+                });
+                ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     ui.label("虚拟容量");
                     self.config_dirty |= ui
@@ -1645,9 +1692,89 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| app.build_page(ui));
         });
         let text = rendered_text(&output.shapes);
-        assert_eq!(text.matches("输出镜像").count(), 1, "{text}");
+        assert_eq!(
+            text.lines().filter(|line| *line == "输出镜像").count(),
+            1,
+            "{text}"
+        );
         assert!(text.contains(".vhdx.partial"), "{text}");
         assert!(!text.contains("本地临时目录"), "{text}");
+        assert!(text.contains("卷标"), "{text}");
+        assert!(
+            text.contains("留空使用输出镜像文件名（去掉 .vhdx）"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn build_request_passes_custom_volume_label_verbatim() {
+        let mut app = DockApp::with_settings(AppConfig {
+            source_path: "source".into(),
+            output_path: "archive.vhdx".into(),
+            volume_label: "  开发归档 ' $x  ".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            app.build_request().unwrap().volume_label,
+            "  开发归档 ' $x  "
+        );
+        app.settings.volume_label.clear();
+        assert_eq!(app.build_request().unwrap().volume_label, "archive");
+        assert!(
+            app.settings.volume_label.is_empty(),
+            "The automatic label must not overwrite the user's empty setting"
+        );
+        app.settings.volume_label = " ".into();
+        assert!(
+            app.build_request().is_err(),
+            "Invalid labels must be reported before starting the worker"
+        );
+        app.settings.volume_label = "A".repeat(33);
+        assert!(app.build_request().is_err());
+    }
+
+    #[test]
+    fn volume_label_and_start_button_fit_default_window() {
+        for width in [1100.0, 1280.0] {
+            let ctx = egui::Context::default();
+            install_style(&ctx);
+            let mut app = DockApp::with_settings(AppConfig {
+                source_path: "source".into(),
+                output_path: "JX3Code-base.vhdx".into(),
+                ..Default::default()
+            });
+            let mut raw = input(vec![]);
+            raw.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(width, 760.0),
+            ));
+            let output = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new().inner_margin(24))
+                    .show(ctx, |ui| {
+                        app.header(ui);
+                        app.build_page(ui);
+                    });
+            });
+            let text = rendered_text(&output.shapes);
+            assert!(text.contains("实际卷标：JX3Code-base"), "{text}");
+            assert!(text.contains("最多 32 个 UTF-16 字符"), "{text}");
+            let button = output
+                .shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(shape) if shape.galley.job.text == "开始制作" => {
+                        Some(shape)
+                    }
+                    _ => None,
+                })
+                .expect("Start button must be rendered");
+            assert!(
+                button.pos.y + button.galley.rect.height() < 720.0,
+                "Start button is clipped at window width {width}: y={}",
+                button.pos.y
+            );
+        }
     }
 
     #[test]

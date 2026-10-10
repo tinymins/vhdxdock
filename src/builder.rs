@@ -62,6 +62,34 @@ fn check_cancel(cancel: &AtomicBool) -> Result<()> {
     Ok(())
 }
 
+/// An empty input follows the output filename; explicit labels are preserved.
+/// Validate before scanning or creating an image so invalid input leaves no partial disk.
+pub fn resolve_volume_label(output: &Path, input: &str) -> Result<String> {
+    let label = if input.is_empty() {
+        output
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .context("无法从输出文件名获取卷标，请手动填写卷标")?
+    } else {
+        input
+    };
+    validate_volume_label(label)?;
+    Ok(label.to_owned())
+}
+
+pub(crate) fn validate_volume_label(label: &str) -> Result<()> {
+    if label.trim().is_empty() {
+        bail!("卷标不能只包含空白字符，请填写名称或留空使用输出文件名");
+    }
+    if label.encode_utf16().count() > 32 {
+        bail!("NTFS 卷标最多 32 个 UTF-16 字符，请缩短卷标（留空时使用输出文件名）");
+    }
+    if label.chars().any(char::is_control) {
+        bail!("卷标不能包含换行、制表符或其他控制字符");
+    }
+    Ok(())
+}
+
 fn capacity_bytes(gib: u64, logical_bytes: u64, entries: usize) -> Result<u64> {
     let capacity = gib
         .checked_mul(1024 * 1024 * 1024)
@@ -567,6 +595,7 @@ fn build_windows(
     {
         bail!("制作仅输出 .vhdx 镜像");
     }
+    let volume_label = resolve_volume_label(&output, &request.volume_label)?;
     let parent = output.parent().context("输出路径必须包含目录")?;
     // Canonicalize the existing parent rather than the absent output. This also
     // detects a destination reached through a junction inside the source.
@@ -628,9 +657,10 @@ fn build_windows(
         .open(log_dir.join(format!("{id}.log")))?;
     writeln!(
         summary,
-        "Source: {}\nOutput: {}\nFiles: {}\nLogical bytes: {}",
+        "Source: {}\nOutput: {}\nVolume label: {}\nFiles: {}\nLogical bytes: {}",
         source.display(),
         output.display(),
+        volume_label,
         manifest.files,
         manifest.bytes
     )?;
@@ -659,7 +689,8 @@ fn build_windows(
         attached: true,
     };
     let copying = (|| -> Result<()> {
-        let target = crate::backend::initialize_new_virtual_disk(&partial, request.compress)?;
+        let target =
+            crate::backend::initialize_new_virtual_disk(&partial, request.compress, &volume_label)?;
         check_cancel(&cancel)?;
         run_robocopy(
             &source, &target, &copy_log, false, &cancel, &progress, &manifest,
@@ -771,6 +802,35 @@ fn build_windows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn volume_label_uses_output_name_or_preserves_custom_unicode() {
+        let output = Path::new("backup/剑三归档-base.vhdx");
+        assert_eq!(resolve_volume_label(output, "").unwrap(), "剑三归档-base");
+        let custom = "剑三 ' $ 归档";
+        assert_eq!(resolve_volume_label(output, custom).unwrap(), custom);
+        let long_output = PathBuf::from(format!("{}.vhdx", "a".repeat(33)));
+        assert!(resolve_volume_label(&long_output, "").is_err());
+        assert_eq!(resolve_volume_label(&long_output, "归档").unwrap(), "归档");
+    }
+
+    #[test]
+    fn volume_label_limits_utf16_length_and_rejects_control_characters() {
+        let output = Path::new("base.vhdx");
+        for valid in ["汉".repeat(32), "🚢".repeat(16)] {
+            assert_eq!(resolve_volume_label(output, &valid).unwrap(), valid);
+        }
+        for invalid in [
+            "汉".repeat(33),
+            "🚢".repeat(17),
+            " \t ".into(),
+            "bad\0label".into(),
+            "bad\nlabel".into(),
+            "   ".into(),
+        ] {
+            assert!(resolve_volume_label(output, &invalid).is_err());
+        }
+    }
+
     #[test]
     fn cancellation_is_clean_only_without_cleanup_context() {
         let cancelled = check_cancel(&AtomicBool::new(true)).unwrap_err();

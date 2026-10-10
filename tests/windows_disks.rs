@@ -86,7 +86,7 @@ fn scratch_differencing_lifecycle_preserves_base() -> Result<()> {
     let moved = scratch.image("moved.vhdx");
     let unrelated = scratch.image("unrelated.vhdx");
     virtual_disk::create_dynamic(&partial, 128 * 1024 * 1024)?;
-    let root = backend::initialize_new_virtual_disk(&partial, true)?;
+    let root = backend::initialize_new_virtual_disk(&partial, true, "Scratch archive")?;
     fs::write(root.join("base-sentinel.txt"), b"immutable base fixture")?;
     virtual_disk::detach(&partial)?;
     fs::rename(&partial, &base)?;
@@ -190,7 +190,7 @@ fn create_independent_base(scratch: &mut Scratch, name: &str, sentinel: &[u8]) -
     let partial = scratch.image(&format!("{name}.vhdx.partial"));
     let base = scratch.image(&format!("{name}.vhdx"));
     virtual_disk::create_dynamic(&partial, 128 * 1024 * 1024)?;
-    let root = backend::initialize_new_virtual_disk(&partial, true)?;
+    let root = backend::initialize_new_virtual_disk(&partial, true, "Scratch archive")?;
     fs::write(root.join("base-sentinel.txt"), sentinel)?;
     virtual_disk::detach(&partial)?;
     fs::rename(&partial, &base)?;

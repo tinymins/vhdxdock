@@ -54,6 +54,7 @@ pub enum VerifyMode {
 pub struct BuildRequest {
     pub source: PathBuf,
     pub output: PathBuf,
+    pub volume_label: String,
     pub capacity_gib: u64,
     pub compress: bool,
     pub verify: VerifyMode,

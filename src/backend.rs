@@ -21,7 +21,7 @@ pub fn relocate(_: &Path, _: &Path) -> Result<()> {
     anyhow::bail!("重新定位功能仅支持 Windows")
 }
 #[cfg(not(windows))]
-pub fn initialize_new_virtual_disk(_: &Path, _: bool) -> Result<PathBuf> {
+pub fn initialize_new_virtual_disk(_: &Path, _: bool, _: &str) -> Result<PathBuf> {
     anyhow::bail!("制作功能仅支持 Windows")
 }
 
@@ -412,14 +412,21 @@ if ($disk.IsReadOnly) { throw '新镜像为只读，停止格式化' }
 $disk = Get-Disk -Number $number -ErrorAction Stop
 if ($disk.IsBoot -or $disk.IsSystem -or $disk.PartitionStyle -ne 'RAW' -or [string]$disk.UniqueId -ne [string]$req.uniqueId) { throw '磁盘身份或状态发生变化，停止格式化' }
 $partition = $disk | Initialize-Disk -PartitionStyle GPT -PassThru -ErrorAction Stop | New-Partition -UseMaximumSize -AssignDriveLetter -ErrorAction Stop
-$formatArgs = @{FileSystem='NTFS'; AllocationUnitSize=4096; NewFileSystemLabel='VhdxDock'; Confirm=$false; ErrorAction='Stop'}
+$formatArgs = @{FileSystem='NTFS'; AllocationUnitSize=4096; NewFileSystemLabel=[string]$req.volumeLabel; Confirm=$false; ErrorAction='Stop'}
 if ([bool]$req.compress) { $formatArgs.Compress = $true }
 $partition | Format-Volume @formatArgs | Out-Null
 $partition = Get-Partition -DiskNumber $number -PartitionNumber $partition.PartitionNumber -ErrorAction Stop
 if (-not $partition.DriveLetter) { throw '新分区未获得盘符' }
+$volume = $partition | Get-Volume -ErrorAction Stop
+if ([string]$volume.FileSystemLabel -cne [string]$req.volumeLabel) { throw '格式化后的卷标与指定名称不一致，停止制作' }
 ConvertTo-Json -InputObject @{root=([string]$partition.DriveLetter + ':\')} -Compress
 "#;
-    pub fn initialize_new_virtual_disk(partial: &Path, compress: bool) -> Result<PathBuf> {
+    pub fn initialize_new_virtual_disk(
+        partial: &Path,
+        compress: bool,
+        volume_label: &str,
+    ) -> Result<PathBuf> {
+        crate::builder::validate_volume_label(volume_label)?;
         if !partial
             .to_string_lossy()
             .to_ascii_lowercase()
@@ -453,7 +460,7 @@ ConvertTo-Json -InputObject @{uniqueId=[string]$disk.UniqueId} -Compress
             }
             let value = process::powershell(
                 INITIALIZE,
-                &json!({"physical": physical, "uniqueId": unique_id, "expectedSize": info.virtual_size, "compress": compress}),
+                &json!({"physical": physical, "uniqueId": unique_id, "expectedSize": info.virtual_size, "compress": compress, "volumeLabel": volume_label}),
             )?;
             let root = value["root"]
                 .as_str()

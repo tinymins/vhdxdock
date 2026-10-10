@@ -12,6 +12,7 @@ pub struct AppConfig {
     pub drive_letter: Option<char>,
     pub source_path: String,
     pub output_path: String,
+    pub volume_label: String,
     pub capacity_gib: u64,
     pub compress: bool,
     pub verify: VerifyMode,
@@ -26,6 +27,7 @@ impl Default for AppConfig {
             drive_letter: None,
             source_path: String::new(),
             output_path: String::new(),
+            volume_label: String::new(),
             capacity_gib: 512,
             compress: true,
             verify: VerifyMode::Metadata,
@@ -101,6 +103,7 @@ mod tests {
         let c: AppConfig = serde_json::from_str("{\"base_path\":\"a.vhdx\"}").unwrap();
         assert_eq!(c.capacity_gib, 512);
         assert!(c.compress);
+        assert!(c.volume_label.is_empty());
     }
     #[test]
     fn paths_roundtrip_without_shell_escaping() {
@@ -110,5 +113,15 @@ mod tests {
         };
         let d: AppConfig = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(c.base_path, d.base_path);
+    }
+
+    #[test]
+    fn custom_volume_label_roundtrips_without_trimming() {
+        let c = AppConfig {
+            volume_label: "  开发归档 ' $x  ".into(),
+            ..Default::default()
+        };
+        let d: AppConfig = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(c.volume_label, d.volume_label);
     }
 }
