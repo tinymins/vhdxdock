@@ -99,6 +99,7 @@ fn scratch_differencing_lifecycle_preserves_base() -> Result<()> {
         base: base.clone(),
         diff: diff.clone(),
         drive_letter: None,
+        mount_folder: None,
     })?;
     let root = mounted_root(&diff)?;
     assert_eq!(
@@ -111,6 +112,7 @@ fn scratch_differencing_lifecycle_preserves_base() -> Result<()> {
         base: base.clone(),
         diff: diff.clone(),
         drive_letter: None,
+        mount_folder: None,
     })?;
     assert_eq!(
         repeated
@@ -142,6 +144,7 @@ fn scratch_differencing_lifecycle_preserves_base() -> Result<()> {
         base: base.clone(),
         diff: diff.clone(),
         drive_letter: None,
+        mount_folder: None,
     })?;
     let root = mounted_root(&diff)?;
     assert_eq!(
@@ -171,6 +174,7 @@ fn scratch_differencing_lifecycle_preserves_base() -> Result<()> {
             base: unrelated.clone(),
             diff: diff.clone(),
             drive_letter: None,
+            mount_folder: None,
         })
         .is_err(),
         "mount accepted an unrelated replacement parent"
@@ -187,6 +191,7 @@ fn scratch_differencing_lifecycle_preserves_base() -> Result<()> {
         base: moved.clone(),
         diff: diff.clone(),
         drive_letter: None,
+        mount_folder: None,
     })?;
     let root = mounted_root(&diff)?;
     assert_eq!(
@@ -264,6 +269,7 @@ fn two_independent_mounts_eject_only_the_requested_disk() -> Result<()> {
         base: base_a.clone(),
         diff: diff_a.clone(),
         drive_letter: None,
+        mount_folder: None,
     })?;
     let root_a = mounted_root(&diff_a)?;
     fs::write(root_a.join("child-a.txt"), b"writes A")?;
@@ -271,6 +277,7 @@ fn two_independent_mounts_eject_only_the_requested_disk() -> Result<()> {
         base: base_b.clone(),
         diff: diff_b.clone(),
         drive_letter: None,
+        mount_folder: None,
     })?;
     assert_eq!(
         rows.iter()
@@ -313,5 +320,329 @@ fn two_independent_mounts_eject_only_the_requested_disk() -> Result<()> {
     backend::unmount(&diff_b)?;
     assert_eq!(digest(&base_a)?, hash_a);
     assert_eq!(digest(&base_b)?, hash_b);
+    Ok(())
+}
+
+fn ensure_ntfs_scratch(folder: &Path) -> Result<()> {
+    let value = process::powershell(
+        r#"
+$root = [IO.Path]::GetPathRoot([string]$req.path)
+if ($root -notmatch '^[A-Za-z]:\\$') { throw 'Folder-mount scratch root must be on a local drive' }
+$volume = Get-Volume -DriveLetter ([char]$root.Substring(0,1)) -ErrorAction Stop
+ConvertTo-Json -InputObject @{filesystem=[string]$volume.FileSystemType} -Compress
+"#,
+        &serde_json::json!({"path": folder}),
+    )?;
+    anyhow::ensure!(
+        value["filesystem"].as_str() == Some("NTFS"),
+        "folder-mount tests require their dedicated tempfile directory on NTFS"
+    );
+    Ok(())
+}
+
+fn assert_no_scratch_drive_letters(diff: &Path) -> Result<()> {
+    let physical = virtual_disk::physical_path(diff)?;
+    let partitions = process::powershell(
+        r#"
+if ([string]$req.physical -notmatch '^\\\\\.\\PhysicalDrive(\d+)$') { throw 'Invalid scratch device' }
+$number = [int]$Matches[1]
+ConvertTo-Json -InputObject @(Get-Partition -DiskNumber $number -ErrorAction Stop | ForEach-Object {
+    @{letter=[string]$_.DriveLetter; access_paths=@($_.AccessPaths)}
+}) -Depth 4 -Compress
+"#,
+        &serde_json::json!({"physical": physical}),
+    )?;
+    let partitions = partitions
+        .as_array()
+        .context("expected scratch partition array")?;
+    anyhow::ensure!(
+        !partitions.is_empty(),
+        "scratch folder image has no partitions"
+    );
+    for partition in partitions {
+        let letter = partition["letter"].as_str().unwrap_or_default();
+        anyhow::ensure!(
+            letter.trim_matches('\0').is_empty(),
+            "folder-mounted scratch image unexpectedly has a drive letter: {partition}"
+        );
+    }
+    Ok(())
+}
+
+fn assert_empty_ordinary_directory(folder: &Path) -> Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(folder)?;
+    anyhow::ensure!(
+        metadata.is_dir(),
+        "mount folder must remain an ordinary directory"
+    );
+    anyhow::ensure!(
+        metadata.file_attributes() & 0x400 == 0,
+        "unmount left a reparse point behind: {}",
+        folder.display()
+    );
+    anyhow::ensure!(
+        fs::read_dir(folder)?.next().is_none(),
+        "unmount did not restore an empty mount folder"
+    );
+    Ok(())
+}
+
+fn assert_requires_eject(error: anyhow::Error) {
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("卸载") || message.contains("弹出"),
+        "changing an attached target must explain that eject is required: {message}"
+    );
+}
+
+#[test]
+#[ignore = "requires Windows elevation and VHDXDOCK_RUN_DISK_TESTS=1; only fresh scratch NTFS folder mounts are modified"]
+fn scratch_folder_mount_is_persistent_and_cleans_its_mount_point() -> Result<()> {
+    enable_test()?;
+    let mut scratch = Scratch::new()?;
+    ensure_ntfs_scratch(scratch.dir.path())?;
+    let base = create_independent_base(&mut scratch, "folder-base", b"folder immutable base")?;
+    let diff = scratch.image("folder-diff.vhdx");
+    let base_hash = digest(&base)?;
+    let folder = scratch.dir.path().join("挂载目录 ' $ 中文");
+    let other_folder = scratch.dir.path().join("other empty target");
+    fs::create_dir(&folder)?;
+    fs::create_dir(&other_folder)?;
+    let conflict_diff = scratch.image("rejected-conflicting-mode-diff.vhdx");
+    assert!(
+        backend::mount(MountRequest {
+            base: base.clone(),
+            diff: conflict_diff.clone(),
+            drive_letter: Some('Z'),
+            mount_folder: Some(folder.clone()),
+        })
+        .is_err(),
+        "request containing both a drive letter and folder must be rejected"
+    );
+    assert_empty_ordinary_directory(&folder)?;
+    assert!(virtual_disk::physical_path(&conflict_diff).is_err());
+    let request = || MountRequest {
+        base: base.clone(),
+        diff: diff.clone(),
+        drive_letter: None,
+        mount_folder: Some(folder.clone()),
+    };
+    let rows = backend::mount(request())?;
+    let row = rows
+        .iter()
+        .find(|row| paths::same_path(&row.image_path, &diff))
+        .context("folder-mounted diff missing from discovery")?;
+    assert!(
+        row.volumes
+            .iter()
+            .any(|path| paths::same_path(Path::new(path), &folder)),
+        "mounted list does not expose the requested folder: {:?}",
+        row.volumes
+    );
+    assert_eq!(
+        fs::read(folder.join("base-sentinel.txt"))?,
+        b"folder immutable base"
+    );
+    assert_no_scratch_drive_letters(&diff)?;
+    fs::write(folder.join("folder-only.txt"), b"persistent folder overlay")?;
+    let device = virtual_disk::physical_path(&diff)?;
+    let repeated = backend::mount(request())?;
+    assert_eq!(virtual_disk::physical_path(&diff)?, device);
+    assert_eq!(
+        repeated
+            .iter()
+            .filter(|row| paths::same_path(&row.image_path, &diff))
+            .count(),
+        1
+    );
+    assert_no_scratch_drive_letters(&diff)?;
+    assert_requires_eject(
+        backend::mount(MountRequest {
+            base: base.clone(),
+            diff: diff.clone(),
+            drive_letter: None,
+            mount_folder: Some(other_folder.clone()),
+        })
+        .expect_err("attached diff must not silently switch mount folders"),
+    );
+    assert_requires_eject(
+        backend::mount(MountRequest {
+            base: base.clone(),
+            diff: diff.clone(),
+            drive_letter: None,
+            mount_folder: None,
+        })
+        .expect_err("attached diff must not silently switch to a drive letter"),
+    );
+    assert_eq!(
+        fs::read(folder.join("folder-only.txt"))?,
+        b"persistent folder overlay"
+    );
+    assert_empty_ordinary_directory(&other_folder)?;
+
+    // An independently initialized second image avoids duplicate GPT IDs and
+    // proves ejecting a folder mount does not affect another folder volume.
+    let base_b = create_independent_base(&mut scratch, "folder-base-b", b"second folder base")?;
+    let hash_b = digest(&base_b)?;
+    let diff_b = scratch.image("folder-diff-b.vhdx");
+    let folder_b = scratch.dir.path().join("independent folder B");
+    fs::create_dir(&folder_b)?;
+    backend::mount(MountRequest {
+        base: base_b.clone(),
+        diff: diff_b.clone(),
+        drive_letter: None,
+        mount_folder: Some(folder_b.clone()),
+    })?;
+    let device_b = virtual_disk::physical_path(&diff_b)?;
+    assert_ne!(device, device_b);
+    assert_no_scratch_drive_letters(&diff_b)?;
+    assert_eq!(
+        fs::read(folder_b.join("base-sentinel.txt"))?,
+        b"second folder base"
+    );
+    fs::write(folder_b.join("b-only.txt"), b"independent folder writes")?;
+
+    let busy = fs::File::open(folder.join("folder-only.txt"))?;
+    assert!(
+        backend::unmount(&diff).is_err(),
+        "folder volume with a live file handle was forcibly ejected"
+    );
+    assert_eq!(
+        fs::read(folder.join("folder-only.txt"))?,
+        b"persistent folder overlay"
+    );
+    drop(busy);
+    backend::unmount(&diff)?;
+    assert_empty_ordinary_directory(&folder)?;
+    assert_eq!(digest(&base)?, base_hash);
+    assert_eq!(virtual_disk::physical_path(&diff_b)?, device_b);
+    assert_eq!(
+        fs::read(folder_b.join("b-only.txt"))?,
+        b"independent folder writes"
+    );
+    fs::write(
+        folder_b.join("after-a-eject.txt"),
+        b"second folder stays writable",
+    )?;
+    // Folder mode may persist NoDefaultDriveLetter in the child partition.
+    // After eject, switching back to automatic letter mode must explicitly
+    // restore a usable letter, while preserving the same local difference.
+    backend::mount(MountRequest {
+        base: base.clone(),
+        diff: diff.clone(),
+        drive_letter: None,
+        mount_folder: None,
+    })?;
+    let letter_root = mounted_root(&diff)?;
+    let letter_text = letter_root.to_string_lossy();
+    let letter_bytes = letter_text.as_bytes();
+    assert!(
+        letter_bytes.len() >= 3
+            && letter_bytes[0].is_ascii_alphabetic()
+            && letter_bytes[1] == b':'
+            && letter_bytes[2] == b'\\',
+        "automatic letter mode did not restore a drive root after folder mode: {}",
+        letter_root.display()
+    );
+    assert_eq!(
+        fs::read(letter_root.join("folder-only.txt"))?,
+        b"persistent folder overlay"
+    );
+    fs::write(
+        letter_root.join("written-via-letter.txt"),
+        b"writes after folder to letter switch",
+    )?;
+    assert_empty_ordinary_directory(&folder)?;
+    backend::unmount(&diff)?;
+    assert_eq!(digest(&base)?, base_hash);
+    backend::mount(request())?;
+    assert_no_scratch_drive_letters(&diff)?;
+    assert_eq!(
+        fs::read(folder.join("folder-only.txt"))?,
+        b"persistent folder overlay"
+    );
+    assert_eq!(
+        fs::read(folder.join("written-via-letter.txt"))?,
+        b"writes after folder to letter switch",
+        "switching back to folder mode lost writes made through the drive letter"
+    );
+    fs::write(folder.join("after-remount.txt"), b"folder remains writable")?;
+    backend::unmount(&diff)?;
+    assert_empty_ordinary_directory(&folder)?;
+    assert_eq!(digest(&base)?, base_hash);
+    assert_eq!(virtual_disk::physical_path(&diff_b)?, device_b);
+    assert_eq!(
+        fs::read(folder_b.join("after-a-eject.txt"))?,
+        b"second folder stays writable"
+    );
+    backend::unmount(&diff_b)?;
+    assert_empty_ordinary_directory(&folder_b)?;
+    assert_eq!(digest(&base_b)?, hash_b);
+
+    let rejected_diff = scratch.image("rejected-nonempty-diff.vhdx");
+    let nonempty = scratch.dir.path().join("nonempty target");
+    fs::create_dir(&nonempty)?;
+    fs::write(nonempty.join("keep.txt"), b"pre-existing host data")?;
+    assert!(
+        backend::mount(MountRequest {
+            base: base.clone(),
+            diff: rejected_diff.clone(),
+            drive_letter: None,
+            mount_folder: Some(nonempty.clone())
+        })
+        .is_err(),
+        "nonempty host directory was accepted as a mount target"
+    );
+    assert_eq!(
+        fs::read(nonempty.join("keep.txt"))?,
+        b"pre-existing host data"
+    );
+    assert!(
+        virtual_disk::physical_path(&rejected_diff).is_err(),
+        "rejected nonempty folder left a child attached"
+    );
+    if rejected_diff.exists() {
+        assert!(!virtual_disk::inspect(&rejected_diff)?.attached);
+    }
+
+    // Both the link and its target are inside this test's scratch directory.
+    // Some Windows runners do not grant symlink creation even when elevated.
+    let link_target = scratch.dir.path().join("link target");
+    let linked_folder = scratch.dir.path().join("directory symlink");
+    fs::create_dir(&link_target)?;
+    match std::os::windows::fs::symlink_dir(&link_target, &linked_folder) {
+        Ok(()) => {
+            let linked_diff = scratch.image("rejected-symlink-diff.vhdx");
+            assert!(
+                backend::mount(MountRequest {
+                    base: base.clone(),
+                    diff: linked_diff.clone(),
+                    drive_letter: None,
+                    mount_folder: Some(linked_folder.clone())
+                })
+                .is_err(),
+                "existing directory symlink was accepted as a mount target"
+            );
+            // The target is deliberately empty: rejection must be about the
+            // existing reparse point, not merely nonempty-directory validation.
+            assert_empty_ordinary_directory(&link_target)?;
+            assert!(fs::symlink_metadata(&linked_folder)?
+                .file_type()
+                .is_symlink());
+            assert!(
+                virtual_disk::physical_path(&linked_diff).is_err(),
+                "rejected symlink left a child attached"
+            );
+            if linked_diff.exists() {
+                assert!(!virtual_disk::inspect(&linked_diff)?.attached);
+            }
+            fs::remove_dir(&linked_folder)?;
+        }
+        Err(error) => {
+            eprintln!("Scratch directory-symlink negative case unavailable on this runner: {error}")
+        }
+    }
+    assert_eq!(digest(&base)?, base_hash);
     Ok(())
 }

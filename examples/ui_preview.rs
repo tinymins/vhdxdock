@@ -2,7 +2,7 @@
 //! created, attached or detached. Only this example's egui framebuffer is saved.
 //!
 //! cargo run --features ui-preview --example ui_preview -- mount D:\QA\mount.png
-//! Scenarios: mount, build, eject, logs.
+//! Scenarios: mount, folder, build, eject, logs.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 #[allow(dead_code)]
@@ -90,8 +90,10 @@ fn main() -> eframe::Result {
         }
     }
     // Documentation views show both mounted example disks without scrolling.
-    let height = if matches!(scenario.as_str(), "mount" | "eject") {
-        860.0
+    let height = if scenario == "folder" {
+        1020.0
+    } else if matches!(scenario.as_str(), "mount" | "eject") {
+        920.0
     } else {
         760.0
     };
@@ -99,7 +101,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_icon(app::application_icon())
             .with_inner_size([1100.0, height])
-            .with_min_inner_size([860.0, 600.0]),
+            .with_min_inner_size([920.0, 600.0]),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };

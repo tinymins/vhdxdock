@@ -30,6 +30,194 @@ mod implementation {
     use crate::{models::DiskKind, paths, process, virtual_disk};
     use anyhow::{bail, Context};
     use serde_json::json;
+    use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
+
+    fn wide_path(path: &Path) -> Result<Vec<u16>> {
+        let mut text: Vec<_> = path.as_os_str().encode_wide().collect();
+        if text.contains(&0) {
+            bail!("路径含有空字符")
+        }
+        text.push(0);
+        Ok(text)
+    }
+    fn access_root(path: &Path) -> String {
+        format!("{}\\", path.to_string_lossy().trim_end_matches('\\'))
+    }
+    fn is_letter_root(path: &str) -> bool {
+        let text = path.trim_end_matches('\\').as_bytes();
+        text.len() == 2 && text[0].is_ascii_alphabetic() && text[1] == b':'
+    }
+    fn volume_name(path: &Path) -> Result<String> {
+        use windows::{
+            core::PCWSTR, Win32::Storage::FileSystem::GetVolumeNameForVolumeMountPointW,
+        };
+        let text = wide_path(Path::new(&access_root(path)))?;
+        let mut output = [0u16; 1024];
+        unsafe { GetVolumeNameForVolumeMountPointW(PCWSTR(text.as_ptr()), &mut output) }
+            .with_context(|| format!("无法确认挂载路径的卷身份：{}", path.display()))?;
+        Ok(String::from_utf16(
+            &output[..output
+                .iter()
+                .position(|&c| c == 0)
+                .context("卷路径未终止")?],
+        )?)
+    }
+    fn same_volume(a: &str, b: &str) -> bool {
+        a.trim_end_matches('\\')
+            .eq_ignore_ascii_case(b.trim_end_matches('\\'))
+    }
+    fn same_access_path(a: &Path, b: &Path) -> bool {
+        let key = |p: &Path| {
+            p.to_string_lossy()
+                .replace('/', "\\")
+                .trim_start_matches(r"\\?\")
+                .trim_end_matches('\\')
+                .to_lowercase()
+        };
+        key(a) == key(b)
+    }
+    fn validate_mount_folder(folder: &Path, already_mounted_here: bool) -> Result<()> {
+        use windows::{
+            core::PCWSTR,
+            Win32::Storage::FileSystem::{
+                GetDriveTypeW, GetVolumeInformationW, GetVolumePathNameW,
+            },
+        };
+        paths::ensure_local(folder).context("挂载文件夹必须位于本地磁盘")?;
+        if folder.file_name().is_none() {
+            bail!("不能挂载到磁盘根目录")
+        }
+        let parent = folder.parent().context("不能挂载到磁盘根目录")?;
+        // Inspect the directory entries themselves, never canonicalize across
+        // a junction/symlink into an unexpected host or a mounted image.
+        for (index, ancestor) in folder.ancestors().enumerate() {
+            let metadata = std::fs::symlink_metadata(ancestor)
+                .with_context(|| format!("挂载文件夹必须已存在：{}", ancestor.display()))?;
+            if !metadata.is_dir() {
+                bail!("挂载目标及其父路径必须是目录")
+            }
+            if metadata.file_attributes() & 0x400 != 0 && !(index == 0 && already_mounted_here) {
+                bail!("挂载文件夹或父目录是重解析点，不能作为挂载目标")
+            }
+        }
+        let text = wide_path(parent)?;
+        let mut host = [0u16; 32768];
+        unsafe { GetVolumePathNameW(PCWSTR(text.as_ptr()), &mut host) }
+            .context("无法确认挂载文件夹的宿主卷")?;
+        if !matches!(unsafe { GetDriveTypeW(PCWSTR(host.as_ptr())) }, 2 | 3) {
+            bail!("挂载文件夹必须位于本地磁盘")
+        }
+        let mut filesystem = [0u16; 64];
+        unsafe {
+            GetVolumeInformationW(
+                PCWSTR(host.as_ptr()),
+                None,
+                None,
+                None,
+                None,
+                Some(&mut filesystem),
+            )
+        }
+        .context("无法读取挂载文件夹的文件系统")?;
+        let end = filesystem
+            .iter()
+            .position(|&c| c == 0)
+            .context("文件系统名称无效")?;
+        if String::from_utf16(&filesystem[..end])? != "NTFS" {
+            bail!("挂载文件夹的宿主文件系统必须是 NTFS")
+        }
+        if !already_mounted_here && std::fs::read_dir(folder)?.next().transpose()?.is_some() {
+            bail!("挂载文件夹必须为空；不会删除已有内容")
+        }
+        Ok(())
+    }
+
+    /// Read only the reparse entry, including after its target volume detached.
+    fn folder_reparse_volume(folder: &Path) -> Result<Option<String>> {
+        use windows::{
+            core::PCWSTR,
+            Win32::{
+                Foundation::CloseHandle,
+                Storage::FileSystem::{
+                    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+                    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+                },
+                System::{Ioctl::FSCTL_GET_REPARSE_POINT, IO::DeviceIoControl},
+            },
+        };
+        if std::fs::symlink_metadata(folder)?.file_attributes() & 0x400 == 0 {
+            return Ok(None);
+        }
+        let path = wide_path(folder)?;
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(path.as_ptr()),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+        }?;
+        let mut buffer = [0u8; 16384];
+        let mut returned = 0;
+        let result = unsafe {
+            DeviceIoControl(
+                handle,
+                FSCTL_GET_REPARSE_POINT,
+                None,
+                0,
+                Some(buffer.as_mut_ptr().cast()),
+                buffer.len() as u32,
+                Some(&mut returned),
+                None,
+            )
+        };
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        result.context("无法读取挂载文件夹的重解析目标")?;
+        let u16_at = |n| u16::from_le_bytes([buffer[n], buffer[n + 1]]) as usize;
+        if returned < 16 || u32::from_le_bytes(buffer[..4].try_into()?) != 0xa0000003 {
+            bail!("挂载路径不是卷挂载点，拒绝移除")
+        }
+        let start = 16usize
+            .checked_add(u16_at(8))
+            .context("重解析目标偏移溢出")?;
+        let end = start
+            .checked_add(u16_at(10))
+            .context("重解析目标长度溢出")?;
+        if end > returned as usize || !start.is_multiple_of(2) || !end.is_multiple_of(2) {
+            bail!("重解析目标数据无效")
+        }
+        let chars: Vec<_> = buffer[start..end]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let target = String::from_utf16(&chars)?;
+        let suffix = target
+            .strip_prefix(r"\??\Volume{")
+            .context("重解析目标不是卷 GUID，拒绝移除")?;
+        Ok(Some(format!(r"\\?\Volume{{{suffix}")))
+    }
+    fn cleanup_folder_mounts(folders: &[(PathBuf, String)]) -> Result<()> {
+        use windows::{core::PCWSTR, Win32::Storage::FileSystem::DeleteVolumeMountPointW};
+        for (folder, expected) in folders {
+            if let Some(actual) = folder_reparse_volume(folder)? {
+                if !same_volume(&actual, expected) {
+                    bail!("挂载文件夹已指向其他卷，拒绝移除：{}", folder.display())
+                }
+                let path = wide_path(Path::new(&access_root(folder)))?;
+                unsafe { DeleteVolumeMountPointW(PCWSTR(path.as_ptr())) }
+                    .with_context(|| format!("无法移除文件夹挂载点：{}", folder.display()))?;
+                if folder_reparse_volume(folder)?.is_some() {
+                    bail!("文件夹挂载点仍存在：{}", folder.display())
+                }
+            }
+        }
+        Ok(())
+    }
 
     const DISCOVER: &str = r#"
 $rows = @()
@@ -40,6 +228,7 @@ foreach ($candidate in @($req.candidates)) {
     $protected = $true
     $readOnly = $true
     $volumes = @()
+    $bindings = @()
     $warning = $null
     try {
         if ($candidate.normalizationError) { throw ('无法规范化枚举设备：' + $candidate.enumeratedPhysical + '；' + $candidate.normalizationError) }
@@ -56,6 +245,7 @@ foreach ($candidate in @($req.candidates)) {
         foreach ($partition in $partitions) {
             if ($partition.IsBoot -or $partition.IsSystem) { $protected = $true }
             $openPaths = @($partition.AccessPaths)
+            $guidPaths = @($partition.AccessPaths | Where-Object { ([string]$_).StartsWith('\\?\Volume{', [StringComparison]::OrdinalIgnoreCase) })
             # AccessPaths can lag behind DriveLetter after Add-PartitionAccessPath.
             # Cached letters must still map to this exact disk and partition.
             if ($partition.DriveLetter -and ([string]$partition.DriveLetter) -match '^[A-Za-z]$') {
@@ -69,6 +259,8 @@ foreach ($candidate in @($req.candidates)) {
             foreach ($access in $openPaths) {
                 if ($access -and $access -notlike '\\?\Volume{*' -and (Test-Path -LiteralPath ([string]$access) -PathType Container)) {
                     $volumes += [string]$access
+                    if ($guidPaths.Count -ne 1) { throw '分区未提供唯一的卷 GUID，无法验证挂载路径' }
+                    $bindings += @{root=[string]$access;guid=[string]$guidPaths[0]}
                     if ($pageRoots -contains [string]$access) { $protected = $true }
                 }
             }
@@ -81,6 +273,7 @@ foreach ($candidate in @($req.candidates)) {
     if (-not $image) { $image = $physical; $protected = $true; $warning = '无法查询基础文件路径，禁止卸载' }
     $rows += [pscustomobject]@{
         image_path = $image; parent_path = $null; volumes = @($volumes | Select-Object -Unique)
+        bindings = @($bindings)
         kind = '未知'; read_only = $readOnly; can_eject = (-not $protected); warning = $warning
     }
 }
@@ -98,8 +291,28 @@ ConvertTo-Json -InputObject @($rows) -Depth 5 -Compress
         }).collect::<Vec<_>>()});
         let value = process::powershell(DISCOVER, &payload)?;
         let mut rows: Vec<MountedImage> =
-            serde_json::from_value(value).context("Windows 返回的挂载列表无效")?;
-        for row in &mut rows {
+            serde_json::from_value(value.clone()).context("Windows 返回的挂载列表无效")?;
+        for (index, row) in rows.iter_mut().enumerate() {
+            for root in &row.volumes {
+                let identity = (|| -> Result<()> {
+                    let bindings = value[index]["bindings"]
+                        .as_array()
+                        .context("缺少挂载路径身份信息")?;
+                    let expected = bindings
+                        .iter()
+                        .find(|binding| binding["root"].as_str() == Some(root))
+                        .and_then(|binding| binding["guid"].as_str())
+                        .context("挂载路径没有对应的分区卷身份")?;
+                    if !same_volume(&volume_name(Path::new(root))?, expected) {
+                        bail!("挂载路径已经指向其他卷")
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = identity {
+                    row.can_eject = false;
+                    row.warning = Some(format!("无法验证挂载路径 {}：{error:#}", root));
+                }
+            }
             match virtual_disk::inspect(&row.image_path) {
                 Ok(info) => {
                     row.parent_path = info.parent;
@@ -146,8 +359,25 @@ foreach ($p in @(Get-Partition -DiskNumber $disk.Number -ErrorAction Stop)) {
     if ($p.IsBoot -or $p.IsSystem) { throw '分区安全检查失败' }
     $v = $p | Get-Volume -ErrorAction SilentlyContinue
     if ($v -and $v.FileSystemType -and [string]$v.FileSystemType -notin @('Unknown','RAW')) { $eligible += $p }
+    elseif ($req.folder -and [string]$p.Type -ne 'Reserved') { throw '文件夹模式无法确认所有数据分区，拒绝挂载' }
 }
 if ($eligible.Count -eq 0) { throw '镜像没有 Windows 可识别的文件系统' }
+if ($req.folder) {
+    if ($eligible.Count -ne 1) { throw '文件夹模式只支持一个数据分区；多分区镜像请使用盘符模式' }
+    $p = $eligible[0]
+    if ($disk.PartitionStyle -eq 'GPT') { $p | Set-Partition -NoDefaultDriveLetter $true -ErrorAction Stop }
+    $p | Add-PartitionAccessPath -AccessPath ([string]$req.folder) -ErrorAction Stop
+    $p = Get-Partition -DiskNumber $disk.Number -PartitionNumber $p.PartitionNumber -ErrorAction Stop
+    $letters = @($p.AccessPaths | Where-Object { [string]$_ -match '^[A-Za-z]:\\$' })
+    if ($p.DriveLetter -and ([string]$p.DriveLetter) -match '^[A-Za-z]$') { $letters += ([string]$p.DriveLetter + ':\') }
+    foreach ($letterPath in @($letters | Select-Object -Unique)) {
+        $p | Remove-PartitionAccessPath -AccessPath $letterPath -ErrorAction Stop
+    }
+    $p = Get-Partition -DiskNumber $disk.Number -PartitionNumber $p.PartitionNumber -ErrorAction Stop
+    if ($p.DriveLetter -or @($p.AccessPaths | Where-Object { [string]$_ -match '^[A-Za-z]:\\$' }).Count) { throw '文件夹挂载仍有盘符，拒绝报告成功' }
+    ConvertTo-Json -InputObject @{ok=$true;partitions=@($p | Select-Object PartitionNumber,DriveLetter,AccessPaths)} -Depth 5 -Compress
+    return
+}
 $first = $true
 foreach ($p in $eligible) {
     if ($first -and $req.letter) {
@@ -181,9 +411,26 @@ try {
 ConvertTo-Json -InputObject $snapshot -Depth 7 -Compress
 "#;
 
+    const VERIFY_FOLDER: &str = r#"
+if ([string]$req.physical -notmatch '^\\\\\.\\PhysicalDrive(\d+)$') { throw '设备路径无效' }
+$disk = Get-Disk -Number ([int]$Matches[1]) -ErrorAction Stop
+$data = @(Get-Partition -DiskNumber $disk.Number -ErrorAction Stop | Where-Object { [string]$_.Type -ne 'Reserved' })
+if ($data.Count -ne 1) { throw '文件夹挂载必须只有一个数据分区' }
+if ($data[0].DriveLetter -or @($data[0].AccessPaths | Where-Object { [string]$_ -match '^[A-Za-z]:\\$' }).Count) { throw '文件夹挂载仍有盘符' }
+ConvertTo-Json -InputObject @{ok=$true} -Compress
+"#;
+
     pub fn mount(request: MountRequest) -> Result<Vec<MountedImage>> {
+        if request.mount_folder.is_some() && request.drive_letter.is_some() {
+            bail!("文件夹模式不能同时指定盘符")
+        }
         let base = paths::resolve(&request.base)?;
         let diff = paths::resolve(&request.diff)?;
+        let folder = request
+            .mount_folder
+            .as_deref()
+            .map(paths::resolve)
+            .transpose()?;
         ensure_finalized(&base)?;
         ensure_finalized(&diff)?;
         paths::ensure_local(&diff)?;
@@ -200,6 +447,17 @@ ConvertTo-Json -InputObject $snapshot -Depth 7 -Compress
         }
         virtual_disk::inspect(&base).context("无法访问基础镜像")?;
         let mounted = list_mounted()?;
+        if let Some(folder) = &folder {
+            let already_here = mounted
+                .iter()
+                .find(|r| paths::same_path(&r.image_path, &diff))
+                .is_some_and(|row| {
+                    row.volumes
+                        .iter()
+                        .any(|root| same_access_path(Path::new(root), folder))
+                });
+            validate_mount_folder(folder, already_here)?;
+        }
         // A backing parent can be loaded by a child without being directly
         // attached. Only a discovered row for the base itself is a direct mount.
         if let Some(row) = mounted
@@ -240,26 +498,77 @@ ConvertTo-Json -InputObject $snapshot -Depth 7 -Compress
             virtual_disk::validate_parent(&diff, &base)?;
         }
         if child.attached {
-            return wait_for_mount_rows(&diff);
+            let rows = wait_for_mount_rows(&diff)?;
+            verify_requested_location(&rows, &diff, folder.as_deref(), request.drive_letter)
+                .context("差分盘已经挂载在其他位置或模式，请先弹出后重试挂载")?;
+            if folder.is_some() {
+                process::powershell(
+                    VERIFY_FOLDER,
+                    &json!({"physical":virtual_disk::physical_path(&diff)?}),
+                )?;
+            }
+            return Ok(rows);
         }
         virtual_disk::attach(&diff)?;
-        let assigned = (|| -> Result<serde_json::Value> {
+        let assigned = (|| -> Result<Vec<MountedImage>> {
             let physical = virtual_disk::physical_path(&diff)?;
-            process::powershell(
+            if let Some(folder) = &folder {
+                validate_mount_folder(folder, false)?;
+            }
+            let assignment = process::powershell(
                 ASSIGN_VOLUMES,
-                &json!({"physical": physical, "letter": request.drive_letter.map(|c| c.to_ascii_uppercase().to_string())}),
-            )
+                &json!({"physical": physical, "letter": request.drive_letter.map(|c| c.to_ascii_uppercase().to_string()), "folder":folder.as_deref().map(access_root)}),
+            )?;
+            let rows = wait_for_mount_rows(&diff).with_context(|| {
+                format!("镜像已连接，但挂载状态未通过检查。分配挂载路径后的快照：{assignment}")
+            })?;
+            verify_requested_location(&rows, &diff, folder.as_deref(), request.drive_letter)?;
+            if folder.is_some() {
+                process::powershell(
+                    VERIFY_FOLDER,
+                    &json!({"physical":virtual_disk::physical_path(&diff)?}),
+                )?;
+            }
+            Ok(rows)
         })();
-        let assignment = match assigned {
-            Ok(value) => value,
+        match assigned {
+            Ok(rows) => Ok(rows),
             Err(error) => {
-                if let Err(detach_error) = virtual_disk::detach(&diff) {
+                if let Err(detach_error) = detach_checked(&diff, &[]) {
                     bail!("{error:#}；挂载回滚失败，请刷新并手动卸载：{detach_error:#}")
                 }
-                return Err(error);
+                Err(error)
             }
-        };
-        wait_for_mount_rows(&diff).with_context(|| format!("镜像已连接，但挂载状态未通过检查；请刷新查看实际状态。分配盘符后的快照：{assignment}"))
+        }
+    }
+
+    fn verify_requested_location(
+        rows: &[MountedImage],
+        diff: &Path,
+        folder: Option<&Path>,
+        letter: Option<char>,
+    ) -> Result<()> {
+        let row = rows
+            .iter()
+            .find(|r| paths::same_path(&r.image_path, diff))
+            .context("找不到目标差分镜像")?;
+        if let Some(folder) = folder {
+            if row.volumes.len() != 1 || !same_access_path(Path::new(&row.volumes[0]), folder) {
+                bail!("差分盘的挂载位置与所选文件夹不一致，或仍然存在盘符/其他挂载点")
+            }
+        } else if let Some(letter) = letter {
+            let expected = format!("{}:\\", letter.to_ascii_uppercase());
+            if !row
+                .volumes
+                .iter()
+                .any(|root| root.eq_ignore_ascii_case(&expected))
+            {
+                bail!("差分盘的盘符与所选盘符不一致")
+            }
+        } else if !row.volumes.iter().any(|root| is_letter_root(root)) {
+            bail!("差分盘当前使用文件夹挂载，请先弹出后切换盘符模式")
+        }
+        Ok(())
     }
     fn wait_for_mount_rows(diff: &Path) -> Result<Vec<MountedImage>> {
         let mut last = anyhow::anyhow!("Windows 尚未返回挂载状态");
@@ -358,11 +667,50 @@ foreach ($expected in @($req.expectedVolumes)) {
 }
 ConvertTo-Json -InputObject @($roots | Select-Object -Unique) -Compress
 "#;
-    fn verify_eject_roots(roots: &[String], image: &MountedImage) -> Result<()> {
-        if !image.volumes.is_empty() && roots.is_empty() {
+    fn verify_eject_roots(roots: &[String], expected_volumes: &[String]) -> Result<()> {
+        if !expected_volumes.is_empty() && roots.is_empty() {
             bail!("已挂载磁盘未返回任何卷路径，拒绝绕过卷锁卸载")
         }
         Ok(())
+    }
+    fn detach_checked(path: &Path, expected_volumes: &[String]) -> Result<()> {
+        let roots = process::powershell(
+            EJECT_ROOTS,
+            &json!({"physical": virtual_disk::physical_path(path)?, "expectedVolumes": expected_volumes}),
+        )?;
+        let roots: Vec<String> = serde_json::from_value(roots)?;
+        verify_eject_roots(&roots, expected_volumes)?;
+        let guid_roots: Vec<_> = roots
+            .iter()
+            .filter(|root| root.to_ascii_lowercase().starts_with(r"\\?\volume{"))
+            .collect();
+        let mut folders = Vec::new();
+        for root in &roots {
+            if root.to_ascii_lowercase().starts_with(r"\\?\volume{") {
+                continue;
+            }
+            let actual = volume_name(Path::new(root))?;
+            if !guid_roots
+                .iter()
+                .any(|expected| same_volume(expected, &actual))
+            {
+                bail!("卷路径已指向目标磁盘以外的卷，拒绝卸载：{root}")
+            }
+            if !is_letter_root(root) {
+                let folder = PathBuf::from(root.trim_end_matches('\\'));
+                let target =
+                    folder_reparse_volume(&folder)?.context("文件夹挂载点已消失，请刷新后重试")?;
+                if !same_volume(&target, &actual) {
+                    bail!("文件夹挂载点身份不匹配，拒绝卸载")
+                }
+                folders.push((folder, actual));
+            }
+        }
+        // Busy handles fail before any mount point is removed. Reparse targets
+        // remain readable without traversing the now-detached target volume.
+        virtual_disk::safe_detach(path, &roots)?;
+        cleanup_folder_mounts(&folders)
+            .context("镜像已经弹出，但文件夹挂载点清理失败；目录和数据未删除")
     }
     pub fn unmount(path: &Path) -> Result<()> {
         let path = paths::resolve(path)?;
@@ -376,13 +724,7 @@ ConvertTo-Json -InputObject @($roots | Select-Object -Unique) -Compress
                 image.warning.unwrap_or_else(|| "磁盘不允许安全卸载".into())
             )
         }
-        let roots = process::powershell(
-            EJECT_ROOTS,
-            &json!({"physical": virtual_disk::physical_path(&path)?, "expectedVolumes": image.volumes}),
-        )?;
-        let roots: Vec<String> = serde_json::from_value(roots)?;
-        verify_eject_roots(&roots, &image)?;
-        virtual_disk::safe_detach(&path, &roots)
+        detach_checked(&path, &image.volumes)
     }
     const INITIALIZE: &str = r#"
 if ([string]$req.physical -notmatch '^\\\\\.\\PhysicalDrive(\d+)$') { throw '无法识别新镜像设备' }
@@ -462,6 +804,130 @@ ConvertTo-Json -InputObject @{uniqueId=[string]$disk.UniqueId} -Compress
     mod tests {
         use super::*;
         #[test]
+        fn folder_and_letter_conflict_is_rejected_before_image_access() {
+            let error = mount(MountRequest {
+                base: "missing-base.vhdx".into(),
+                diff: "missing-diff.vhdx".into(),
+                drive_letter: Some('F'),
+                mount_folder: Some("missing-folder".into()),
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains("不能同时指定盘符"));
+        }
+        #[test]
+        fn folder_preflight_requires_existing_empty_plain_local_directory() {
+            let temp = tempfile::tempdir().unwrap();
+            let folder = temp.path().join("挂载 ' $ 文件夹");
+            assert!(validate_mount_folder(&folder, false).is_err());
+            std::fs::create_dir(&folder).unwrap();
+            validate_mount_folder(&folder, false).unwrap();
+            assert!(folder_reparse_volume(&folder).unwrap().is_none());
+            std::fs::write(folder.join("keep.txt"), b"must remain").unwrap();
+            assert!(validate_mount_folder(&folder, false).is_err());
+            cleanup_folder_mounts(&[(folder.clone(), r"\\?\Volume{unused}\".into())]).unwrap();
+            assert_eq!(
+                std::fs::read(folder.join("keep.txt")).unwrap(),
+                b"must remain"
+            );
+            let root = folder.ancestors().last().unwrap();
+            assert!(validate_mount_folder(root, false).is_err());
+            assert!(validate_mount_folder(Path::new(r"\\nas\share\folder"), false).is_err());
+        }
+        #[test]
+        fn folder_preflight_and_cleanup_refuse_directory_junctions() {
+            let temp = tempfile::tempdir().unwrap();
+            let target = temp.path().join("target");
+            let junction = temp.path().join("junction");
+            std::fs::create_dir_all(target.join("empty-child")).unwrap();
+            std::fs::write(target.join("keep.txt"), b"must remain").unwrap();
+            process::powershell(r#"
+New-Item -ItemType Junction -Path ([string]$req.link) -Target ([string]$req.target) -ErrorAction Stop | Out-Null
+ConvertTo-Json -InputObject @{ok=$true} -Compress
+"#, &json!({"link":junction,"target":target})).unwrap();
+            assert!(validate_mount_folder(&junction, false).is_err());
+            assert!(validate_mount_folder(&junction.join("empty-child"), false).is_err());
+            // A directory junction shares the mount-point tag but points to a
+            // filesystem path, so it must never pass as a volume-GUID mount.
+            assert!(folder_reparse_volume(&junction).is_err());
+            assert!(
+                cleanup_folder_mounts(&[(junction.clone(), r"\\?\Volume{unused}\".into())])
+                    .is_err()
+            );
+            assert_eq!(
+                std::fs::read(target.join("keep.txt")).unwrap(),
+                b"must remain"
+            );
+            std::fs::remove_dir(junction).unwrap(); // Remove only our junction entry.
+        }
+        #[test]
+        fn repeated_mount_must_match_requested_mode_and_location() {
+            let diff = Path::new("fixture-diff.vhdx");
+            let mut row = MountedImage {
+                image_path: diff.into(),
+                parent_path: None,
+                volumes: vec![r"C:\mounts\one\".into()],
+                kind: "差分".into(),
+                read_only: false,
+                can_eject: true,
+                warning: None,
+            };
+            assert!(verify_requested_location(
+                &[row.clone()],
+                diff,
+                Some(Path::new(r"c:\mounts\one")),
+                None
+            )
+            .is_ok());
+            assert!(verify_requested_location(
+                &[row.clone()],
+                diff,
+                Some(Path::new(r"C:\mounts\two")),
+                None
+            )
+            .is_err());
+            assert!(verify_requested_location(&[row.clone()], diff, None, None).is_err());
+            row.volumes.push(r"F:\".into());
+            assert!(verify_requested_location(
+                &[row.clone()],
+                diff,
+                Some(Path::new(r"C:\mounts\one")),
+                None
+            )
+            .is_err());
+            assert!(verify_requested_location(&[row.clone()], diff, None, Some('G')).is_err());
+            assert!(verify_requested_location(&[row], diff, None, Some('f')).is_ok());
+        }
+        #[test]
+        fn folder_assignment_refuses_ambiguous_partitions_and_removes_cached_letter() {
+            let mock = r#"
+function Get-Disk { [pscustomobject]@{Number=999;IsBoot=$false;IsSystem=$false;IsReadOnly=$false;IsOffline=$false;PartitionStyle='GPT'} }
+function Get-Partition {
+    param($DiskNumber,$PartitionNumber)
+    $paths = @('\\?\Volume{fixture}\')
+    if ($script:folderAdded) { $paths += [string]$req.folder }
+    if (-not $script:letterRemoved) { $paths += 'F:\' }
+    foreach ($n in 1..([int]$req.count)) { [pscustomobject]@{DiskNumber=999;PartitionNumber=$n;Type='Basic';IsBoot=$false;IsSystem=$false;DriveLetter=$(if ($script:letterRemoved) {$null} else {'F'});AccessPaths=$paths} }
+}
+function Get-Volume { [pscustomobject]@{FileSystemType='NTFS'} }
+function Set-Partition { param($NoDefaultDriveLetter) if (-not $NoDefaultDriveLetter) { throw 'must disable default letters' } }
+function Add-PartitionAccessPath { param($AccessPath,$AssignDriveLetter) if ($AssignDriveLetter -or $AccessPath -ne $req.folder) { throw 'unexpected drive assignment' }; $script:folderAdded=$true }
+function Remove-PartitionAccessPath { param($AccessPath) if ($AccessPath -ne 'F:\') { throw 'only fixture cached letter may be removed' }; $script:letterRemoved=$true }
+"#;
+            let script = format!("{mock}\n{ASSIGN_VOLUMES}");
+            let request = |count| json!({"physical":r"\\.\PhysicalDrive999","folder":r"C:\mounts\fixture\","count":count});
+            let result = process::powershell(&script, &request(1)).unwrap();
+            assert_eq!(
+                result["partitions"][0]["DriveLetter"],
+                serde_json::Value::Null
+            );
+            assert!(result["partitions"][0]["AccessPaths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p.as_str() != Some(r"F:\")));
+            assert!(process::powershell(&script, &request(2)).is_err());
+        }
+        #[test]
         fn discovery_letter_fallback_requires_an_accessible_root() {
             let mock = r#"
 function Get-CimInstance { @() }
@@ -503,6 +969,7 @@ function Test-Path {
                     base: base.into(),
                     diff: diff.into(),
                     drive_letter: None,
+                    mount_folder: None,
                 })
                 .unwrap_err();
                 assert!(error.to_string().contains(".partial"));
@@ -569,6 +1036,7 @@ function Get-Partition {
                 INITIALIZE,
                 EJECT_ROOTS,
                 MOUNT_DIAGNOSTICS,
+                VERIFY_FOLDER,
             ] {
                 process::powershell(r#"
 $tokens = $null; $parseErrors = $null

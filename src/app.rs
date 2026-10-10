@@ -187,6 +187,11 @@ impl DockApp {
                 warning: None,
             },
         ];
+        if scenario == "folder" {
+            app.settings.mount_mode = MountMode::Folder;
+            app.settings.mount_folder = r"D:\Mounts\Archive".into();
+            app.disks[0].volumes = vec![r"D:\Mounts\Archive\".into()];
+        }
         if scenario == "build" {
             app.tab = Tab::Build;
         }
@@ -291,20 +296,28 @@ impl DockApp {
         });
     }
 
+    fn mount_request(&self) -> Result<MountRequest, String> {
+        Ok(MountRequest {
+            base: Self::resolved(&self.settings.base_path)?,
+            diff: Self::resolved(&self.settings.diff_path)?,
+            drive_letter: match self.settings.mount_mode {
+                MountMode::DriveLetter => self.settings.drive_letter,
+                MountMode::Folder => None,
+            },
+            mount_folder: match self.settings.mount_mode {
+                MountMode::DriveLetter => None,
+                MountMode::Folder => Some(Self::resolved(&self.settings.mount_folder)?),
+            },
+        })
+    }
+
     fn mount(&mut self) {
         if !self.operations_allowed() {
             return;
         }
-        let request = match (
-            Self::resolved(&self.settings.base_path),
-            Self::resolved(&self.settings.diff_path),
-        ) {
-            (Ok(base), Ok(diff)) => MountRequest {
-                base,
-                diff,
-                drive_letter: self.settings.drive_letter,
-            },
-            (Err(error), _) | (_, Err(error)) => {
+        let request = match self.mount_request() {
+            Ok(request) => request,
+            Err(error) => {
                 self.report(error, true);
                 return;
             }
@@ -617,43 +630,74 @@ impl DockApp {
                 });
                 ui.add_space(13.0);
                 control_row(ui, |ui| {
-                    ui.label("盘符");
-                    let old_letter = self.settings.drive_letter;
-                    let selected = self
-                        .settings
-                        .drive_letter
-                        .map(|d| format!("{d}:"))
-                        .unwrap_or_else(|| "自动".into());
-                    egui::ComboBox::from_id_salt("drive_letter")
-                        .selected_text(selected)
-                        .width(85.0)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.settings.drive_letter, None, "自动");
-                            for letter in 'A'..='Z' {
-                                let used = self.disks.iter().flat_map(|disk| &disk.volumes).any(
-                                    |volume| {
-                                        volume.to_uppercase().starts_with(&format!("{letter}:"))
-                                    },
-                                );
-                                ui.add_enabled_ui(
-                                    !used || self.settings.drive_letter == Some(letter),
-                                    |ui| {
-                                        ui.selectable_value(
-                                            &mut self.settings.drive_letter,
-                                            Some(letter),
-                                            format!(
-                                                "{letter}:{}",
-                                                if used { "  已使用" } else { "" }
-                                            ),
-                                        );
-                                    },
-                                );
-                            }
-                        });
-                    self.config_dirty |= old_letter != self.settings.drive_letter;
+                    ui.label("挂载位置");
+                    let previous = self.settings.mount_mode;
+                    ui.selectable_value(
+                        &mut self.settings.mount_mode,
+                        MountMode::DriveLetter,
+                        "盘符",
+                    );
+                    ui.selectable_value(&mut self.settings.mount_mode, MountMode::Folder, "文件夹");
+                    self.config_dirty |= previous != self.settings.mount_mode;
+                });
+                if self.settings.mount_mode == MountMode::Folder {
+                    self.config_dirty |= path_input(
+                        ui,
+                        "挂载文件夹",
+                        &mut self.settings.mount_folder,
+                        Browse::MountFolder,
+                    );
+                    ui.label(
+                        RichText::new("选择本地 NTFS 上已有的空文件夹；不会自动创建目录。")
+                            .size(12.0)
+                            .color(MUTED),
+                    );
+                    ui.add_space(6.0);
+                }
+                control_row(ui, |ui| {
+                    if self.settings.mount_mode == MountMode::DriveLetter {
+                        ui.label("盘符");
+                        let old_letter = self.settings.drive_letter;
+                        let selected = self
+                            .settings
+                            .drive_letter
+                            .map(|d| format!("{d}:"))
+                            .unwrap_or_else(|| "自动".into());
+                        egui::ComboBox::from_id_salt("drive_letter")
+                            .selected_text(selected)
+                            .width(85.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.settings.drive_letter, None, "自动");
+                                for letter in 'A'..='Z' {
+                                    let used = self
+                                        .disks
+                                        .iter()
+                                        .flat_map(|disk| &disk.volumes)
+                                        .any(|volume| {
+                                            volume.to_uppercase().starts_with(&format!("{letter}:"))
+                                        });
+                                    ui.add_enabled_ui(
+                                        !used || self.settings.drive_letter == Some(letter),
+                                        |ui| {
+                                            ui.selectable_value(
+                                                &mut self.settings.drive_letter,
+                                                Some(letter),
+                                                format!(
+                                                    "{letter}:{}",
+                                                    if used { "  已使用" } else { "" }
+                                                ),
+                                            );
+                                        },
+                                    );
+                                }
+                            });
+                        self.config_dirty |= old_letter != self.settings.drive_letter;
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let enabled = !self.settings.base_path.trim().is_empty()
-                            && !self.settings.diff_path.trim().is_empty();
+                            && !self.settings.diff_path.trim().is_empty()
+                            && (self.settings.mount_mode == MountMode::DriveLetter
+                                || !self.settings.mount_folder.trim().is_empty());
                         if ui.add_enabled(enabled, primary("挂载", 106.0)).clicked() {
                             self.mount();
                         }
@@ -766,26 +810,31 @@ impl DockApp {
                 ui.add_space(20.0);
             } else {
                 let available = ui.available_width();
+                let location_width = (available * 0.22).clamp(110.0, 180.0);
+                let actions_width = 2.0 * CONTROL_HEIGHT + ui.spacing().item_spacing.x;
+                let path_width =
+                    ((available - location_width - actions_width - 36.0) / 2.0).max(100.0);
                 egui::Grid::new("mounted_images")
                     .num_columns(4)
                     .spacing([12.0, 12.0])
                     .striped(true)
                     .show(ui, |ui| {
-                        for header in ["盘符 / 状态", "挂载镜像", "基础镜像", "操作"]
+                        for header in ["挂载位置 / 状态", "挂载镜像", "基础镜像", "操作"]
                         {
                             ui.label(RichText::new(header).size(12.0).color(MUTED));
                         }
                         ui.end_row();
                         for disk in &self.disks {
                             ui.vertical(|ui| {
-                                ui.set_min_width(94.0);
-                                ui.label(
-                                    RichText::new(if disk.volumes.is_empty() {
-                                        "无盘符".into()
+                                ui.set_width(location_width);
+                                truncated_path(
+                                    ui,
+                                    &if disk.volumes.is_empty() {
+                                        "无挂载位置".into()
                                     } else {
                                         disk.volumes.join("  ")
-                                    })
-                                    .strong(),
+                                    },
+                                    location_width,
                                 );
                                 ui.label(
                                     RichText::new(if disk.read_only {
@@ -797,7 +846,6 @@ impl DockApp {
                                     .color(if disk.read_only { MUTED } else { ACCENT }),
                                 );
                             });
-                            let path_width = ((available - 220.0) / 2.0).max(130.0);
                             ui.vertical(|ui| {
                                 truncated_path(
                                     ui,
@@ -1168,17 +1216,25 @@ impl DockApp {
             let mut confirm = false;
             egui::Modal::new(egui::Id::new("eject_confirmation")).show(ctx, |ui| {
                 ui.set_width(460.0);
-                ui.heading(format!(
-                    "确认卸载 {}？",
-                    if confirmation.image.volumes.is_empty() {
-                        "此镜像".into()
-                    } else {
-                        confirmation.image.volumes.join("、")
-                    }
-                ));
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!(
+                            "确认卸载 {}？",
+                            if confirmation.image.volumes.is_empty() {
+                                "此镜像".into()
+                            } else {
+                                confirmation.image.volumes.join("、")
+                            }
+                        ))
+                        .heading(),
+                    )
+                    .wrap(),
+                );
                 ui.add_space(10.0);
                 ui.label("挂载镜像：");
-                ui.label(confirmation.image.image_path.display().to_string());
+                ui.add(
+                    egui::Label::new(confirmation.image.image_path.display().to_string()).wrap(),
+                );
                 ui.add_space(10.0);
                 ui.label("卸载后已保存的修改仍保留，请先保存并关闭盘内文件。");
                 ui.add_space(16.0);
@@ -1209,7 +1265,7 @@ impl DockApp {
                 ui.heading("选择要打开的卷");
                 ui.add_space(12.0);
                 for volume in volumes {
-                    if ui.add(button(volume)).clicked() {
+                    if ui.add(button(volume).wrap()).clicked() {
                         chosen = Some(volume.clone());
                     }
                 }
@@ -1457,6 +1513,7 @@ enum Browse {
     Image,
     SaveDiff,
     Folder,
+    MountFolder,
     SaveVhdx,
 }
 
@@ -1474,6 +1531,7 @@ fn path_input(ui: &mut egui::Ui, label: &str, value: &mut String, kind: Browse) 
                         Browse::Image => r"本地路径或 \\NAS\共享\镜像.vhdx",
                         Browse::SaveDiff => r".\diffs\镜像-diff.vhdx",
                         Browse::Folder => r"E:\需要归档的文件夹",
+                        Browse::MountFolder => r"D:\Mounts\Archive",
                         Browse::SaveVhdx => r"D:\Backup\镜像-base.vhdx",
                     }),
             )
@@ -1500,7 +1558,7 @@ fn path_input(ui: &mut egui::Ui, label: &str, value: &mut String, kind: Browse) 
             let chosen = match kind {
                 Browse::Image => dialog.add_filter("虚拟硬盘", &["vhdx", "vhd"]).pick_file(),
                 Browse::SaveDiff => dialog.add_filter("虚拟硬盘", &["vhdx", "vhd"]).save_file(),
-                Browse::Folder => dialog.pick_folder(),
+                Browse::Folder | Browse::MountFolder => dialog.pick_folder(),
                 Browse::SaveVhdx => dialog.add_filter("VHDX 镜像", &["vhdx"]).save_file(),
             };
             if let Some(path) = chosen {
@@ -1859,6 +1917,96 @@ mod tests {
             can_eject: true,
             warning: None,
         }
+    }
+
+    #[test]
+    fn selecting_mount_mode_changes_the_request_and_preserves_diff_and_drive() {
+        for width in [860.0, 900.0] {
+            let ctx = egui::Context::default();
+            install_style(&ctx);
+            let mut app = DockApp::with_settings(AppConfig {
+                base_path: "archive.vhdx".into(),
+                diff_path: "diffs/archive-diff.vhdx".into(),
+                drive_letter: Some('Q'),
+                mount_folder: "mounts/archive".into(),
+                ..Default::default()
+            });
+            let original_diff = app.settings.diff_path.clone();
+            let render = |app: &mut DockApp, events| {
+                let mut raw = input(events);
+                raw.screen_rect = Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(width, 900.0),
+                ));
+                ctx.run(raw, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.mount_page(ui));
+                })
+            };
+            let initial = render(&mut app, vec![]);
+            let folder = text_rect(&initial.shapes, "文件夹").center();
+            let _ = render(&mut app, pointer_events(folder, true));
+            let selected = render(&mut app, pointer_events(folder, false));
+            assert_eq!(app.settings.mount_mode, MountMode::Folder);
+            assert!(app.config_dirty);
+            assert!(rendered_text(&selected.shapes).contains("已有的空文件夹"));
+            assert!(text_rect(&selected.shapes, "挂载").right() < width);
+            let folder_request = app.mount_request().unwrap();
+            assert_eq!(folder_request.drive_letter, None);
+            assert_eq!(
+                folder_request.mount_folder,
+                Some(DockApp::resolved("mounts/archive").unwrap())
+            );
+            assert_eq!(
+                folder_request.diff,
+                DockApp::resolved(&original_diff).unwrap()
+            );
+            let drive = text_rect(&selected.shapes, "盘符").center();
+            let _ = render(&mut app, pointer_events(drive, true));
+            let _ = render(&mut app, pointer_events(drive, false));
+            assert_eq!(app.settings.mount_mode, MountMode::DriveLetter);
+            let drive_request = app.mount_request().unwrap();
+            assert_eq!(drive_request.drive_letter, Some('Q'));
+            assert!(drive_request.mount_folder.is_none());
+            assert_eq!(app.settings.diff_path, original_diff);
+            assert_eq!(app.settings.mount_folder, "mounts/archive");
+            app.settings.mount_mode = MountMode::Folder;
+            app.settings.mount_folder.clear();
+            assert!(app.mount_request().is_err());
+        }
+    }
+
+    #[test]
+    fn long_folder_mounts_keep_table_actions_and_confirmation_inside_the_window() {
+        let ctx = egui::Context::default();
+        install_style(&ctx);
+        let mut app = DockApp::with_settings(AppConfig::default());
+        let folder = format!(r"D:\Mounts\{}\", "ArchiveDocuments".repeat(12));
+        let mut mounted = disk("F", "archive");
+        mounted.volumes = vec![folder.clone()];
+        app.disks = vec![mounted.clone()];
+        let mut raw = input(vec![]);
+        raw.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            Vec2::new(860.0, 900.0),
+        ));
+        let output = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.mounted_list(ui));
+        });
+        assert!(text_rect(&output.shapes, "操作").right() < 860.0);
+        assert!(rendered_text(&output.shapes).contains("挂载位置 / 状态"));
+        app.eject = Some(EjectConfirmation {
+            image: mounted,
+            focus_cancel: true,
+        });
+        // egui sizes a newly opened Area in an invisible first pass.
+        let _ = ctx.run(input(vec![]), |ctx| app.dialogs(ctx));
+        let output = ctx.run(input(vec![]), |ctx| app.dialogs(ctx));
+        let heading = text_rect(&output.shapes, &format!("确认卸载 {folder}？"));
+        assert!(
+            heading.width() <= 461.0,
+            "Long mount paths must wrap in the modal"
+        );
+        assert!(app.disk_busy.is_none());
     }
 
     #[test]

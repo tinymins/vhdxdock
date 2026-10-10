@@ -1,4 +1,4 @@
-use crate::models::VerifyMode;
+use crate::models::{MountMode, VerifyMode};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -10,6 +10,8 @@ pub struct AppConfig {
     pub base_path: String,
     pub diff_path: String,
     pub drive_letter: Option<char>,
+    pub mount_mode: MountMode,
+    pub mount_folder: String,
     pub source_path: String,
     pub output_path: String,
     pub volume_label: String,
@@ -25,6 +27,8 @@ impl Default for AppConfig {
             base_path: String::new(),
             diff_path: String::new(),
             drive_letter: None,
+            mount_mode: MountMode::DriveLetter,
+            mount_folder: String::new(),
             source_path: String::new(),
             output_path: String::new(),
             volume_label: String::new(),
@@ -104,6 +108,8 @@ mod tests {
         assert_eq!(c.capacity_gib, 512);
         assert!(c.compress);
         assert!(c.volume_label.is_empty());
+        assert_eq!(c.mount_mode, MountMode::DriveLetter);
+        assert!(c.mount_folder.is_empty());
     }
     #[test]
     fn paths_roundtrip_without_shell_escaping() {
@@ -123,5 +129,20 @@ mod tests {
         };
         let d: AppConfig = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(c.volume_label, d.volume_label);
+    }
+
+    #[test]
+    fn folder_mount_settings_preserve_the_previous_drive_choice() {
+        let c = AppConfig {
+            mount_mode: MountMode::Folder,
+            mount_folder: r"D:\Mounts\Archive ' $x".into(),
+            drive_letter: Some('Q'),
+            ..Default::default()
+        };
+        let restored: AppConfig =
+            serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(restored.mount_mode, MountMode::Folder);
+        assert_eq!(restored.mount_folder, c.mount_folder);
+        assert_eq!(restored.drive_letter, Some('Q'));
     }
 }

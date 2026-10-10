@@ -339,6 +339,7 @@ ConvertTo-Json -InputObject @{ok=$true} -Compress
         base: base.clone(),
         diff: diff.clone(),
         drive_letter: None,
+        mount_folder: None,
     };
     let rows = mount_scratch(
         request(),

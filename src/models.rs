@@ -30,6 +30,14 @@ pub struct MountRequest {
     pub base: PathBuf,
     pub diff: PathBuf,
     pub drive_letter: Option<char>,
+    pub mount_folder: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MountMode {
+    #[default]
+    DriveLetter,
+    Folder,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
