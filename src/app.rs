@@ -629,34 +629,19 @@ impl DockApp {
                     }
                 });
                 ui.add_space(13.0);
+                ui.label(RichText::new("挂载位置").strong().size(13.0));
                 control_row(ui, |ui| {
-                    ui.label("挂载位置");
                     let previous = self.settings.mount_mode;
                     ui.selectable_value(
                         &mut self.settings.mount_mode,
                         MountMode::DriveLetter,
                         "盘符",
-                    );
-                    ui.selectable_value(&mut self.settings.mount_mode, MountMode::Folder, "文件夹");
+                    )
+                    .on_hover_text("自动分配空闲盘符，或选择指定盘符。");
+                    ui.selectable_value(&mut self.settings.mount_mode, MountMode::Folder, "文件夹")
+                        .on_hover_text("选择本地 NTFS 上已有的空文件夹；不会自动创建目录。\n仅支持单个数据分区，挂载后不保留盘符。");
                     self.config_dirty |= previous != self.settings.mount_mode;
-                });
-                if self.settings.mount_mode == MountMode::Folder {
-                    self.config_dirty |= path_input(
-                        ui,
-                        "挂载文件夹",
-                        &mut self.settings.mount_folder,
-                        Browse::MountFolder,
-                    );
-                    ui.label(
-                        RichText::new("选择本地 NTFS 上已有的空文件夹；不会自动创建目录。")
-                            .size(12.0)
-                            .color(MUTED),
-                    );
-                    ui.add_space(6.0);
-                }
-                control_row(ui, |ui| {
                     if self.settings.mount_mode == MountMode::DriveLetter {
-                        ui.label("盘符");
                         let old_letter = self.settings.drive_letter;
                         let selected = self
                             .settings
@@ -692,20 +677,46 @@ impl DockApp {
                                 }
                             });
                         self.config_dirty |= old_letter != self.settings.drive_letter;
+                    } else {
+                        let input_width =
+                            (ui.available_width() - 62.0 - 106.0 - 2.0 * ui.spacing().item_spacing.x)
+                                .max(40.0);
+                        self.config_dirty |= ui
+                            .add_sized(
+                                [input_width, CONTROL_HEIGHT],
+                                egui::TextEdit::singleline(&mut self.settings.mount_folder)
+                                    .vertical_align(egui::Align::Center)
+                                    .min_size(Vec2::new(0.0, CONTROL_HEIGHT))
+                                    .hint_text(r"D:\Mounts\Archive"),
+                            )
+                            .changed();
+                        if ui.add_sized([62.0, CONTROL_HEIGHT], button("浏览")).clicked() {
+                            let mut dialog = rfd::FileDialog::new();
+                            if let Ok(path) = Self::resolved(&self.settings.mount_folder) {
+                                if path.is_dir() {
+                                    dialog = dialog.set_directory(path);
+                                } else if let Some(parent) = path.parent() {
+                                    dialog = dialog.set_directory(parent);
+                                }
+                            }
+                            if let Some(path) = dialog.pick_folder() {
+                                self.settings.mount_folder = path.display().to_string();
+                                self.config_dirty = true;
+                            }
+                        }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let enabled = !self.settings.base_path.trim().is_empty()
                             && !self.settings.diff_path.trim().is_empty()
                             && (self.settings.mount_mode == MountMode::DriveLetter
                                 || !self.settings.mount_folder.trim().is_empty());
-                        if ui.add_enabled(enabled, primary("挂载", 106.0)).clicked() {
+                        if ui
+                            .add_enabled(enabled, primary("挂载", 106.0))
+                            .on_hover_text("差分镜像不存在时自动创建；已存在时继续使用。")
+                            .clicked()
+                        {
                             self.mount();
                         }
-                        ui.label(
-                            RichText::new("差分不存在时自动创建")
-                                .size(12.0)
-                                .color(MUTED),
-                        );
                     });
                 });
             });
@@ -1513,7 +1524,6 @@ enum Browse {
     Image,
     SaveDiff,
     Folder,
-    MountFolder,
     SaveVhdx,
 }
 
@@ -1531,7 +1541,6 @@ fn path_input(ui: &mut egui::Ui, label: &str, value: &mut String, kind: Browse) 
                         Browse::Image => r"本地路径或 \\NAS\共享\镜像.vhdx",
                         Browse::SaveDiff => r".\diffs\镜像-diff.vhdx",
                         Browse::Folder => r"E:\需要归档的文件夹",
-                        Browse::MountFolder => r"D:\Mounts\Archive",
                         Browse::SaveVhdx => r"D:\Backup\镜像-base.vhdx",
                     }),
             )
@@ -1558,7 +1567,7 @@ fn path_input(ui: &mut egui::Ui, label: &str, value: &mut String, kind: Browse) 
             let chosen = match kind {
                 Browse::Image => dialog.add_filter("虚拟硬盘", &["vhdx", "vhd"]).pick_file(),
                 Browse::SaveDiff => dialog.add_filter("虚拟硬盘", &["vhdx", "vhd"]).save_file(),
-                Browse::Folder | Browse::MountFolder => dialog.pick_folder(),
+                Browse::Folder => dialog.pick_folder(),
                 Browse::SaveVhdx => dialog.add_filter("VHDX 镜像", &["vhdx"]).save_file(),
             };
             if let Some(path) = chosen {
@@ -1943,13 +1952,63 @@ mod tests {
                 })
             };
             let initial = render(&mut app, vec![]);
+            let assert_row = |output: &egui::FullOutput, mode| {
+                let text = rendered_text(&output.shapes);
+                assert_eq!(text.lines().filter(|line| *line == "挂载位置").count(), 1);
+                assert!(!text.contains("挂载文件夹"), "No duplicate folder heading");
+                assert!(
+                    !text.contains("已有的空文件夹"),
+                    "Folder guidance belongs in a tooltip"
+                );
+                assert!(
+                    !text.contains("差分不存在时自动创建"),
+                    "Mount guidance belongs in a tooltip"
+                );
+                let drive = text_rect(&output.shapes, "盘符");
+                let folder = text_rect(&output.shapes, "文件夹");
+                let mount = text_rect(&output.shapes, "挂载");
+                let target = text_rect(
+                    &output.shapes,
+                    if mode == MountMode::Folder {
+                        "mounts/archive"
+                    } else {
+                        "Q:"
+                    },
+                );
+                assert!(text_rect(&output.shapes, "挂载位置").bottom() < drive.top());
+                for control in [folder, target, mount] {
+                    assert!(
+                        (control.center().y - drive.center().y).abs() < 1.5,
+                        "Mount options, target and action must share one centered row"
+                    );
+                }
+                assert!(
+                    mount.right() + 20.0 < width,
+                    "The full mount button must fit"
+                );
+                if mode == MountMode::Folder {
+                    let browse = output
+                        .shapes
+                        .iter()
+                        .filter_map(|clipped| match &clipped.shape {
+                            egui::Shape::Text(shape) if shape.galley.job.text == "浏览" => Some(
+                                egui::Rect::from_min_size(shape.pos, shape.galley.rect.size()),
+                            ),
+                            _ => None,
+                        })
+                        .next_back()
+                        .expect("Folder browse button");
+                    assert!((browse.center().y - drive.center().y).abs() < 1.5);
+                    assert!(target.left() > folder.right() && browse.right() < mount.left());
+                }
+            };
+            assert_row(&initial, MountMode::DriveLetter);
             let folder = text_rect(&initial.shapes, "文件夹").center();
             let _ = render(&mut app, pointer_events(folder, true));
             let selected = render(&mut app, pointer_events(folder, false));
             assert_eq!(app.settings.mount_mode, MountMode::Folder);
             assert!(app.config_dirty);
-            assert!(rendered_text(&selected.shapes).contains("已有的空文件夹"));
-            assert!(text_rect(&selected.shapes, "挂载").right() < width);
+            assert_row(&selected, MountMode::Folder);
             let folder_request = app.mount_request().unwrap();
             assert_eq!(folder_request.drive_letter, None);
             assert_eq!(
