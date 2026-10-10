@@ -398,8 +398,29 @@ mod native {
         validate_parent(diff, base)
     }
     pub fn validate_parent(diff: &Path, base: &Path) -> Result<()> {
+        if paths::image_format(base)? != paths::image_format(diff)? {
+            bail!("基础镜像与差分格式必须一致")
+        }
+        if paths::same_path(diff, base) {
+            bail!("基础镜像和差分不能是同一个文件")
+        }
         let child = open(diff, false, true)?;
         let parent = open(base, false, true)?;
+        let subtype = unsafe {
+            info(&child, GET_VIRTUAL_DISK_INFO_PROVIDER_SUBTYPE)?
+                .Anonymous
+                .ProviderSubtype
+        };
+        if subtype != 4 {
+            bail!("待挂载镜像必须是差分镜像")
+        }
+        let child_size = unsafe { info(&child, GET_VIRTUAL_DISK_INFO_SIZE)?.Anonymous.Size };
+        let parent_size = unsafe { info(&parent, GET_VIRTUAL_DISK_INFO_SIZE)?.Anonymous.Size };
+        if child_size.VirtualSize != parent_size.VirtualSize
+            || child_size.SectorSize != parent_size.SectorSize
+        {
+            bail!("父镜像容量或逻辑扇区大小与差分不匹配")
+        }
         let expected = unsafe {
             info(&child, GET_VIRTUAL_DISK_INFO_PARENT_IDENTIFIER)?
                 .Anonymous
@@ -541,7 +562,7 @@ mod native {
     }
     pub fn relocate_parent(diff: &Path, base: &Path) -> Result<()> {
         if inspect(diff)?.attached {
-            bail!("请先卸载差分盘，再重新定位父镜像")
+            bail!("差分盘已挂载，请先弹出后重试挂载")
         }
         if paths::image_format(base)? != paths::image_format(diff)? {
             bail!("基础镜像与差分格式必须一致")
@@ -781,7 +802,12 @@ mod native {
                 assert_eq!(digest(&base), initial_hash, "creating child changed parent");
                 assert_eq!(inspect(&child).unwrap().kind, DiskKind::Differencing);
                 validate_parent(&child, &base).unwrap();
-                std::fs::copy(&base, &relocated).unwrap();
+                // The old parent is deliberately absent: metadata inspection
+                // and validation must not require resolving its previous path.
+                std::fs::rename(&base, &relocated).unwrap();
+                assert!(!base.exists());
+                assert_eq!(inspect(&child).unwrap().kind, DiskKind::Differencing);
+                validate_parent(&child, &relocated).unwrap();
                 relocate_parent(&child, &relocated).unwrap();
                 assert!(paths::same_path(
                     &inspect(&child).unwrap().parent.unwrap(),
@@ -801,6 +827,96 @@ mod native {
                     "rejected relocation modified child"
                 );
             }
+        }
+
+        #[test]
+        fn changed_vhdx_data_linkage_is_rejected_before_relocation() {
+            // Only this newly-created, unattached scratch file is changed.
+            // Keep its persistent VirtualDiskId and size, but update both valid
+            // headers' DataWriteGuid as a compliant writer would before data
+            // changes. This distinguishes data linkage from persistent identity.
+            let temp = tempfile::tempdir().unwrap();
+            let base = temp.path().join("base.vhdx");
+            let child = temp.path().join("child.vhdx");
+            let changed = temp.path().join("changed.vhdx");
+            create_dynamic(&base, 64 * 1024 * 1024).unwrap();
+            create_difference(&base, &child).unwrap();
+            let persistent = unsafe {
+                info(
+                    &open(&base, false, true).unwrap(),
+                    GET_VIRTUAL_DISK_INFO_VIRTUAL_DISK_ID,
+                )
+                .unwrap()
+                .Anonymous
+                .VirtualDiskId
+            };
+            let mut bytes = std::fs::read(&base).unwrap();
+            for start in [64 * 1024, 128 * 1024] {
+                let header = &mut bytes[start..start + 4096];
+                assert_eq!(&header[..4], b"head");
+                header[32] ^= 0x80;
+                header[4..8].fill(0);
+                let mut crc = u32::MAX;
+                for byte in header.iter() {
+                    crc ^= u32::from(*byte);
+                    for _ in 0..8 {
+                        crc = (crc >> 1) ^ (0x82f6_3b78 & 0u32.wrapping_sub(crc & 1));
+                    }
+                }
+                header[4..8].copy_from_slice(&(!crc).to_le_bytes());
+            }
+            std::fs::write(&changed, bytes).unwrap();
+            let changed_handle = open(&changed, false, true).unwrap();
+            assert_eq!(
+                unsafe {
+                    info(&changed_handle, GET_VIRTUAL_DISK_INFO_VIRTUAL_DISK_ID)
+                        .unwrap()
+                        .Anonymous
+                        .VirtualDiskId
+                },
+                persistent,
+                "fixture must preserve persistent identity"
+            );
+            drop(changed_handle);
+            let before = digest(&child);
+            assert!(validate_parent(&child, &changed).is_err());
+            assert!(relocate_parent(&child, &changed).is_err());
+            assert_eq!(
+                digest(&child),
+                before,
+                "wrong parent must not update child metadata"
+            );
+        }
+
+        #[test]
+        fn resized_vhd_parent_is_rejected_before_relocation() {
+            // Legacy VHD keeps its identity when expanded; capacity must be
+            // checked independently before changing a child's parent locator.
+            let temp = tempfile::tempdir().unwrap();
+            let base = temp.path().join("base.vhd");
+            let child = temp.path().join("child.vhd");
+            create_dynamic(&base, 64 * 1024 * 1024).unwrap();
+            create_difference(&base, &child).unwrap();
+            let h = open(&base, true, true).unwrap();
+            let params = EXPAND_VIRTUAL_DISK_PARAMETERS {
+                Version: EXPAND_VIRTUAL_DISK_VERSION_1,
+                Anonymous: EXPAND_VIRTUAL_DISK_PARAMETERS_0 {
+                    Version1: EXPAND_VIRTUAL_DISK_PARAMETERS_0_0 {
+                        NewSize: 128 * 1024 * 1024,
+                    },
+                },
+            };
+            check(
+                unsafe { ExpandVirtualDisk(h.0, EXPAND_VIRTUAL_DISK_FLAG_NONE, &params, None) },
+                "扩大测试镜像",
+            )
+            .unwrap();
+            drop(h);
+            let before = digest(&child);
+            let error = validate_parent(&child, &base).unwrap_err();
+            assert!(error.to_string().contains("容量"), "{error:#}");
+            assert!(relocate_parent(&child, &base).is_err());
+            assert_eq!(digest(&child), before);
         }
 
         #[test]

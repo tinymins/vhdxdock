@@ -159,9 +159,30 @@ fn scratch_differencing_lifecycle_preserves_base() -> Result<()> {
 
     virtual_disk::create_dynamic(&unrelated, 128 * 1024 * 1024)?;
     assert!(virtual_disk::validate_parent(&diff, &unrelated).is_err());
-    assert!(backend::relocate(&diff, &unrelated).is_err());
-    fs::copy(&base, &moved)?;
-    backend::relocate(&diff, &moved)?;
+    let unrelated_hash = digest(&unrelated)?;
+    // A real move removes the original parent path. Automatic recovery must
+    // still work, and selecting an unrelated replacement must not mutate diff.
+    fs::rename(&base, &moved)?;
+    assert!(!base.exists(), "the old parent path must really be absent");
+    assert_eq!(digest(&moved)?, base_hash);
+    let diff_before_rejected_mount = digest(&diff)?;
+    assert!(
+        backend::mount(MountRequest {
+            base: unrelated.clone(),
+            diff: diff.clone(),
+            drive_letter: None,
+        })
+        .is_err(),
+        "mount accepted an unrelated replacement parent"
+    );
+    assert_eq!(
+        digest(&diff)?,
+        diff_before_rejected_mount,
+        "rejected replacement parent changed the difference image"
+    );
+    assert_eq!(digest(&unrelated)?, unrelated_hash);
+    // Supplying the correct moved base is sufficient: no separate relocate
+    // operation is part of the application workflow anymore.
     backend::mount(MountRequest {
         base: moved.clone(),
         diff: diff.clone(),
@@ -169,20 +190,46 @@ fn scratch_differencing_lifecycle_preserves_base() -> Result<()> {
     })?;
     let root = mounted_root(&diff)?;
     assert_eq!(
+        fs::read(root.join("base-sentinel.txt"))?,
+        b"immutable base fixture",
+        "automatic parent recovery changed the base data"
+    );
+    assert_eq!(
         fs::read(root.join("child-only.txt"))?,
         b"persistent local writes"
     );
+    let recovered_parent = virtual_disk::inspect(&diff)?
+        .parent
+        .context("automatically recovered difference has no parent path")?;
+    assert!(paths::same_path(&recovered_parent, &moved));
     backend::unmount(&diff)?;
-    assert_eq!(digest(&base)?, base_hash);
+    assert!(!base.exists());
     assert_eq!(digest(&moved)?, base_hash);
 
     let old_base = scratch.image("legacy.vhd");
     let old_diff = scratch.image("legacy-diff.vhd");
+    let old_moved = scratch.image("legacy-moved.vhd");
+    let old_unrelated = scratch.image("legacy-unrelated.vhd");
     virtual_disk::create_dynamic(&old_base, 64 * 1024 * 1024)?;
     let old_hash = digest(&old_base)?;
     virtual_disk::create_difference(&old_base, &old_diff)?;
     virtual_disk::validate_parent(&old_diff, &old_base)?;
     assert_eq!(digest(&old_base)?, old_hash);
+    // Legacy VHD fixtures are intentionally RAW, so exercise only the native
+    // parent operation; backend::mount correctly requires a filesystem.
+    fs::rename(&old_base, &old_moved)?;
+    assert!(!old_base.exists());
+    virtual_disk::create_dynamic(&old_unrelated, 64 * 1024 * 1024)?;
+    let old_diff_hash = digest(&old_diff)?;
+    assert!(virtual_disk::relocate_parent(&old_diff, &old_unrelated).is_err());
+    assert_eq!(digest(&old_diff)?, old_diff_hash);
+    virtual_disk::relocate_parent(&old_diff, &old_moved)?;
+    virtual_disk::validate_parent(&old_diff, &old_moved)?;
+    let old_parent = virtual_disk::inspect(&old_diff)?
+        .parent
+        .context("relocated legacy VHD difference has no parent path")?;
+    assert!(paths::same_path(&old_parent, &old_moved));
+    assert_eq!(digest(&old_moved)?, old_hash);
     Ok(())
 }
 

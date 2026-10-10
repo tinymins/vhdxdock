@@ -17,10 +17,6 @@ pub fn list_mounted() -> Result<Vec<MountedImage>> {
     Ok(Vec::new())
 }
 #[cfg(not(windows))]
-pub fn relocate(_: &Path, _: &Path) -> Result<()> {
-    anyhow::bail!("重新定位功能仅支持 Windows")
-}
-#[cfg(not(windows))]
 pub fn initialize_new_virtual_disk(_: &Path, _: bool, _: &str) -> Result<PathBuf> {
     anyhow::bail!("制作功能仅支持 Windows")
 }
@@ -234,10 +230,14 @@ ConvertTo-Json -InputObject $snapshot -Depth 7 -Compress
                 .join(actual_parent)
         };
         if !paths::same_path(&actual_parent, &base) {
-            bail!(
-                "差分镜像仍指向 {}；请使用重新定位基础镜像",
-                actual_parent.display()
-            )
+            if child.attached {
+                bail!("差分盘已挂载，请先弹出，再用新的基础镜像地址挂载")
+            }
+            // The selected base is authoritative. Only change the child locator
+            // after identity validation; never rewrite or ignore the base identity.
+            virtual_disk::relocate_parent(&diff, &base)
+                .context("无法自动更新差分盘中的基础镜像路径")?;
+            virtual_disk::validate_parent(&diff, &base)?;
         }
         if child.attached {
             return wait_for_mount_rows(&diff);
@@ -305,10 +305,7 @@ ConvertTo-Json -InputObject $snapshot -Depth 7 -Compress
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("partial"))
         {
-            bail!(
-                ".partial 是尚未完成的镜像，不能挂载或重新定位：{}",
-                path.display()
-            )
+            bail!(".partial 是尚未完成的镜像，不能挂载：{}", path.display())
         }
         Ok(())
     }
@@ -387,18 +384,6 @@ ConvertTo-Json -InputObject @($roots | Select-Object -Unique) -Compress
         verify_eject_roots(&roots, &image)?;
         virtual_disk::safe_detach(&path, &roots)
     }
-    pub fn relocate(diff: &Path, base: &Path) -> Result<()> {
-        let diff = paths::resolve(diff)?;
-        let base = paths::resolve(base)?;
-        ensure_finalized(&base)?;
-        ensure_finalized(&diff)?;
-        paths::ensure_local(&diff)?;
-        if paths::same_path(&diff, &base) {
-            bail!("基础镜像与差分不能是同一个文件")
-        }
-        virtual_disk::relocate_parent(&diff, &base)
-    }
-
     const INITIALIZE: &str = r#"
 if ([string]$req.physical -notmatch '^\\\\\.\\PhysicalDrive(\d+)$') { throw '无法识别新镜像设备' }
 $number = [int]$Matches[1]
@@ -509,7 +494,7 @@ function Test-Path {
             }
         }
         #[test]
-        fn partial_mount_and_relocation_are_rejected_before_disk_operations() {
+        fn partial_mount_is_rejected_before_disk_operations() {
             for (base, diff) in [
                 ("base.vhdx.partial", "diff.vhdx"),
                 ("base.vhdx", "diff.vhdx.PARTIAL"),
@@ -520,8 +505,6 @@ function Test-Path {
                     drive_letter: None,
                 })
                 .unwrap_err();
-                assert!(error.to_string().contains(".partial"));
-                let error = relocate(Path::new(diff), Path::new(base)).unwrap_err();
                 assert!(error.to_string().contains(".partial"));
             }
         }

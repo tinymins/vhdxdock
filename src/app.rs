@@ -74,10 +74,6 @@ pub struct DockApp {
     close_confirmation: bool,
     close_focus_cancel: bool,
     exit_when_idle: bool,
-    relocate_diff: String,
-    relocate_base: String,
-    relocation_confirmation: bool,
-    relocation_focus_cancel: bool,
     config_dirty: bool,
     last_save: Instant,
     #[cfg(feature = "ui-preview")]
@@ -133,10 +129,6 @@ impl DockApp {
             close_confirmation: false,
             close_focus_cancel: false,
             exit_when_idle: false,
-            relocate_diff: String::new(),
-            relocate_base: String::new(),
-            relocation_confirmation: false,
-            relocation_focus_cancel: false,
             config_dirty: false,
             last_save: Instant::now(),
             #[cfg(feature = "ui-preview")]
@@ -314,33 +306,6 @@ impl DockApp {
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(Event::Disks {
                 action: "镜像已卸载，差分中的修改已保留".into(),
-                result,
-            });
-        });
-    }
-
-    fn relocate(&mut self) {
-        if !self.operations_allowed() {
-            return;
-        }
-        let (diff, base) = match (
-            Self::resolved(&self.relocate_diff),
-            Self::resolved(&self.relocate_base),
-        ) {
-            (Ok(diff), Ok(base)) => (diff, base),
-            (Err(error), _) | (_, Err(error)) => {
-                self.report(error, true);
-                return;
-            }
-        };
-        self.disk_busy = Some("正在验证并更新父镜像路径".into());
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let result = backend::relocate(&diff, &base)
-                .and_then(|_| backend::list_mounted())
-                .map_err(|e| format!("{e:#}"));
-            let _ = tx.send(Event::Disks {
-                action: "基础镜像路径已更新".into(),
                 result,
             });
         });
@@ -658,23 +623,6 @@ impl DockApp {
         });
         ui.add_space(14.0);
         self.mounted_list(ui);
-        ui.add_space(12.0);
-        egui::CollapsingHeader::new("高级 · 重新定位基础镜像").id_salt("relocate").show(ui, |ui| {
-            card(ui, |ui| {
-                ui.label(RichText::new("将 base 搬到 NAS 后，为已卸载的差分盘更新父路径。只有父链身份匹配时才能关联。").color(MUTED));
-                ui.add_space(8.0);
-                ui.add_enabled_ui(self.disk_busy.is_none(), |ui| {
-                    path_input(ui, "已有差分", &mut self.relocate_diff, Browse::Image);
-                    ui.add_space(8.0);
-                    path_input(ui, "新的基础镜像", &mut self.relocate_base, Browse::Image);
-                    ui.add_space(8.0);
-                    if ui.add_enabled(!self.relocate_diff.trim().is_empty() && !self.relocate_base.trim().is_empty(), egui::Button::new("验证并更新父路径")).clicked() {
-                        self.relocation_confirmation = true;
-                        self.relocation_focus_cancel = true;
-                    }
-                });
-            });
-        });
     }
 
     fn mounted_list(&mut self, ui: &mut egui::Ui) {
@@ -1157,39 +1105,6 @@ impl DockApp {
                 self.open_volumes = None;
             }
         }
-        if self.relocation_confirmation {
-            let mut dismiss = false;
-            let mut confirm = false;
-            egui::Modal::new(egui::Id::new("relocate_confirmation")).show(ctx, |ui| {
-                ui.set_width(460.0);
-                ui.heading("确认更新父镜像路径？");
-                ui.add_space(10.0);
-                ui.label(format!("差分：{}", self.relocate_diff));
-                ui.label(format!("基础：{}", self.relocate_base));
-                ui.label(
-                    RichText::new("差分必须已卸载。工具将验证父链身份，不会强制忽略不匹配。")
-                        .color(MUTED),
-                );
-                ui.add_space(15.0);
-                ui.horizontal(|ui| {
-                    let response = ui.button("取消");
-                    if self.relocation_focus_cancel {
-                        response.request_focus();
-                        self.relocation_focus_cancel = false;
-                    }
-                    dismiss = response.clicked();
-                    confirm = ui
-                        .add_enabled(self.disk_busy.is_none(), primary("验证并更新", 110.0))
-                        .clicked();
-                });
-            });
-            if confirm {
-                self.relocation_confirmation = false;
-                self.relocate();
-            } else if dismiss {
-                self.relocation_confirmation = false;
-            }
-        }
     }
 }
 
@@ -1648,6 +1563,18 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| app.mount_page(ui));
         });
         let text = rendered_text(&output.shapes);
+        assert_eq!(
+            text.lines().filter(|line| *line == "基础镜像").count(),
+            2,
+            "One base input plus one table heading must remain: {text}"
+        );
+        assert_eq!(
+            text.lines().filter(|line| *line == "本地差分镜像").count(),
+            1,
+            "{text}"
+        );
+        assert!(!text.contains("重新定位"), "{text}");
+        assert!(!text.contains("验证并更新父路径"), "{text}");
         assert!(text.contains("F:\\"), "{text}");
         assert!(text.contains("G:\\"), "{text}");
         assert!(text.contains(r"D:\Diff\alpha.vhdx"), "{text}");
