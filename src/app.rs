@@ -146,18 +146,18 @@ impl DockApp {
     pub fn preview(ctx: &egui::Context, scenario: &str) -> Self {
         install_style(ctx);
         let settings = AppConfig {
-            base_path: r"\\NAS\archives\JX3Code-base.vhdx".into(),
-            diff_path: r"D:\VhdxDock\diffs\JX3Code-base-diff.vhdx".into(),
-            source_path: r"E:\X\E".into(),
-            output_path: r"D:\Backup\JX3Code-base.vhdx".into(),
+            base_path: r"\\NAS\backup\Archive.vhdx".into(),
+            diff_path: r"D:\VhdxDock\diffs\Archive-diff.vhdx".into(),
+            source_path: r"D:\Data\Archive".into(),
+            output_path: r"D:\Images\Archive.vhdx".into(),
             ..Default::default()
         };
         let mut app = Self::with_settings(settings);
         app.preview_mode = true;
         app.disks = vec![
             MountedImage {
-                image_path: PathBuf::from(r"D:\VhdxDock\diffs\JX3Code-base-diff.vhdx"),
-                parent_path: Some(PathBuf::from(r"\\NAS\archives\JX3Code-base.vhdx")),
+                image_path: PathBuf::from(r"D:\VhdxDock\diffs\Archive-diff.vhdx"),
+                parent_path: Some(PathBuf::from(r"\\NAS\backup\Archive.vhdx")),
                 volumes: vec![r"F:\".into()],
                 kind: "差分 VHDX".into(),
                 read_only: false,
@@ -165,8 +165,8 @@ impl DockApp {
                 warning: None,
             },
             MountedImage {
-                image_path: PathBuf::from(r"D:\VhdxDock\diffs\Toolchain-diff.vhd"),
-                parent_path: Some(PathBuf::from(r"\\NAS\archives\Toolchain.vhd")),
+                image_path: PathBuf::from(r"D:\VhdxDock\diffs\Photos-diff.vhd"),
+                parent_path: Some(PathBuf::from(r"\\NAS\backup\Photos.vhd")),
                 volumes: vec![r"G:\".into()],
                 kind: "差分 VHD".into(),
                 read_only: false,
@@ -182,8 +182,8 @@ impl DockApp {
             app.logs = [
                 "VhdxDock 已启动",
                 "已刷新挂载列表：2 个镜像",
-                r"基础镜像：\\NAS\archives\JX3Code-base.vhdx",
-                r"本地差分：D:\VhdxDock\diffs\JX3Code-base-diff.vhdx",
+                r"基础镜像：\\NAS\backup\Archive.vhdx",
+                r"本地差分：D:\VhdxDock\diffs\Archive-diff.vhdx",
                 "镜像已挂载，修改将保存在差分盘中",
             ]
             .into_iter()
@@ -1958,7 +1958,7 @@ mod tests {
             install_style(&ctx);
             let mut app = DockApp::with_settings(AppConfig {
                 source_path: "source".into(),
-                output_path: "JX3Code-base.vhdx".into(),
+                output_path: "Archive.vhdx".into(),
                 ..Default::default()
             });
             let mut raw = input(vec![]);
@@ -1984,7 +1984,7 @@ mod tests {
                     });
             });
             let text = rendered_text(&output.shapes);
-            assert!(text.contains("实际卷标：JX3Code-base"), "{text}");
+            assert!(text.contains("实际卷标：Archive"), "{text}");
             assert!(text.contains("最多 32 个 UTF-16 字符"), "{text}");
             let (button, clip) = output
                 .shapes

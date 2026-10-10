@@ -89,9 +89,15 @@ fn main() -> eframe::Result {
             let _ = std::fs::create_dir_all(parent);
         }
     }
+    // Documentation views show both mounted example disks without scrolling.
+    let height = if matches!(scenario.as_str(), "mount" | "eject") {
+        860.0
+    } else {
+        760.0
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 760.0])
+            .with_inner_size([1100.0, height])
             .with_min_inner_size([860.0, 600.0]),
         renderer: eframe::Renderer::Glow,
         ..Default::default()

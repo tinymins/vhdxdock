@@ -8,7 +8,7 @@ Windows 便携式 VHDX 镜像制作与 VHD/VHDX 差分挂载工具。
 
 ## 界面预览
 
-以下截图由应用自身渲染，使用示例路径和磁盘数据：
+以下截图由应用自身渲染，文件名、文件夹、NAS 地址和挂载记录均为虚构的演示数据。
 
 ![挂载与多磁盘管理](docs/screenshots/mount.png)
 ![制作镜像](docs/screenshots/build.png)
@@ -38,30 +38,30 @@ Windows 便携式 VHDX 镜像制作与 VHD/VHDX 差分挂载工具。
 
 ## 挂载 NAS 镜像
 
-1. 基础镜像填 `\\NAS\backup\JX3Code-base.vhdx`，推荐使用 UNC 地址而不是映射盘符。
-2. 差分默认 `.\diffs\JX3Code-base-diff.vhdx`，也可选择如 `D:\Diff\JX3Code-diff.vhdx`。挂载时会自动创建缺失的目录；已保存的差分路径保持不变，点击恢复默认可使用新目录。
+1. 基础镜像填 `\\NAS\backup\Archive.vhdx`，推荐使用 UNC 地址而不是映射盘符。
+2. 差分默认 `.\diffs\Archive-diff.vhdx`，也可选择如 `D:\Diff\Archive-diff.vhdx`。挂载时会自动创建缺失的目录；已保存的差分路径保持不变，点击 **恢复默认差分路径** 可使用新目录。
 3. 选择自动或指定盘符，点击 **挂载**。
 4. 在下方列表点击文件夹图标打开磁盘，点击弹出图标并确认后卸载。
 
-所有相对路径固定相对于 **exe 所在目录**；界面显示实际绝对路径。差分必须放本地，大小会随修改增加。如果 exe 在 C 盘而希望写入 D 盘，请修改差分路径。
+所有相对路径固定相对于 **exe 所在目录**；界面显示实际绝对路径。例如软件位于 `D:\VhdxDock\VhdxDock.exe`，默认差分文件就是 `D:\VhdxDock\diffs\Archive-diff.vhdx`。差分必须放本地，大小会随修改增加。如果 exe 在 C 盘而希望写入 D 盘，请修改差分路径。
 
 差分仅保存变化，**不能脱离基础镜像使用**。卸载不会丢弃修改；关闭工具窗口也不会卸载已挂载磁盘。基础镜像在被差分依赖后必须保持原样，不要直接写入、合并、替换或重建。NAS 权限和 Windows 凭据由系统管理，本工具不保存密码。
 
 ## 制作文件夹镜像
 
-填写源文件夹和一个输出镜像路径，设置卷标，选择虚拟容量（默认 512 GiB）、压缩和校验方式，然后开始制作。卷标就是资源管理器中盘符前的名称，可输入中文；留空则取输出文件名去掉 `.vhdx`，例如 `XE-base.vhdx` 默认显示 `XE-base`。名称最多 32 个 UTF-16 字符，过长时需手动填写较短卷标。它在格式化新基础镜像时写入，由之后创建的差分盘继承，挂载操作不会覆盖该名称。
+填写源文件夹和一个输出镜像路径，设置卷标，选择虚拟容量（默认 512 GiB）、压缩和校验方式，然后开始制作。卷标就是资源管理器中盘符前的名称，可输入中文；留空则取输出文件名去掉 `.vhdx`，例如 `Archive.vhdx` 默认显示 `Archive`。名称最多 32 个 UTF-16 字符，过长时需手动填写较短卷标。它在格式化新基础镜像时写入，由之后创建的差分盘继承，挂载操作不会覆盖该名称。
 
 制作期间请停止修改源目录；一期不提供 VSS 在线快照。
 
-例如源 `E:\X\E`，输出 `D:\Backup\XE-base.vhdx`：
+例如源 `D:\Data\Archive`，输出 `D:\Images\Archive.vhdx`：
 
 ```text
-E:\X\E\Base        → 镜像根目录\Base
-E:\X\E\DevEnv      → 镜像根目录\DevEnv
+D:\Data\Archive\Documents  → 镜像根目录\Documents
+D:\Data\Archive\Photos     → 镜像根目录\Photos
 
-制作中：D:\Backup\XE-base.vhdx.partial
-完成后：D:\Backup\XE-base.vhdx
-校验值：D:\Backup\XE-base.vhdx.sha256
+制作中：D:\Images\Archive.vhdx.partial
+完成后：D:\Images\Archive.vhdx
+校验值：D:\Images\Archive.vhdx.sha256
 ```
 
 镜像数据全程写在选定输出目录，**不会缓存到 C 盘**，完成改名也不复制第二份镜像。NAS 输出采用相同流程，直接写到 NAS。
@@ -75,7 +75,7 @@ E:\X\E\DevEnv      → 镜像根目录\DevEnv
 可在管理员 PowerShell 检查镜像文件哈希：
 
 ```powershell
-Get-FileHash -LiteralPath 'D:\Backup\XE-base.vhdx' -Algorithm SHA256
+Get-FileHash -LiteralPath 'D:\Images\Archive.vhdx' -Algorithm SHA256
 ```
 
 ## 移动基础镜像
