@@ -192,7 +192,9 @@ mod implementation {
             bail!("重解析目标数据无效")
         }
         let chars: Vec<_> = buffer[start..end]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         let target = String::from_utf16(&chars)?;
