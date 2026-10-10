@@ -1,3 +1,5 @@
+<img src="assets/icon.png" alt="VhdxDock" width="96" height="96">
+
 # VhdxDock
 
 Windows 便携式 VHDX 镜像制作与 VHD/VHDX 差分挂载工具。

@@ -97,6 +97,7 @@ fn main() -> eframe::Result {
     };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_icon(app::application_icon())
             .with_inner_size([1100.0, height])
             .with_min_inner_size([860.0, 600.0]),
         renderer: eframe::Renderer::Glow,

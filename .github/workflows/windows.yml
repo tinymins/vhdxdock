@@ -46,6 +46,8 @@ jobs:
           New-Item -ItemType Directory -Path package | Out-Null
           Copy-Item target/release/vhdxdock.exe package/VhdxDock.exe
           Copy-Item README.md,LICENSE package/
+          New-Item -ItemType Directory -Path package/assets | Out-Null
+          Copy-Item assets/icon.png,assets/icon.ico package/assets/
           New-Item -ItemType Directory -Path package/docs | Out-Null
           Copy-Item docs/screenshots package/docs/ -Recurse
           $hash = (Get-FileHash package/VhdxDock.exe -Algorithm SHA256).Hash.ToLowerInvariant()

@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -21,6 +21,17 @@ const MUTED: Color32 = Color32::from_rgb(100, 116, 139);
 const BORDER: Color32 = Color32::from_rgb(221, 228, 235);
 const CARD_PADDING: i8 = 18;
 const CONTROL_HEIGHT: f32 = 34.0;
+
+/// Decode the embedded artwork once and share it with the window and brand.
+pub fn application_icon() -> Arc<egui::IconData> {
+    static ICON: OnceLock<Arc<egui::IconData>> = OnceLock::new();
+    Arc::clone(ICON.get_or_init(|| {
+        Arc::new(
+            eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+                .expect("embedded application icon must be a valid PNG"),
+        )
+    }))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Tab {
@@ -57,6 +68,7 @@ struct EjectConfirmation {
 
 pub struct DockApp {
     settings: AppConfig,
+    brand_texture: Option<egui::TextureHandle>,
     tab: Tab,
     disks: Vec<MountedImage>,
     tx: mpsc::Sender<Event>,
@@ -112,6 +124,7 @@ impl DockApp {
         let last_auto_base = settings.base_path.clone();
         Self {
             settings,
+            brand_texture: None,
             tab: Tab::Mount,
             disks: Vec::new(),
             tx,
@@ -508,6 +521,17 @@ impl DockApp {
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
+        let brand_texture = self.brand_texture.get_or_insert_with(|| {
+            let icon = application_icon();
+            ui.ctx().load_texture(
+                "vhdxdock-brand",
+                egui::ColorImage::from_rgba_unmultiplied(
+                    [icon.width as usize, icon.height as usize],
+                    &icon.rgba,
+                ),
+                egui::TextureOptions::LINEAR,
+            )
+        });
         let brand_height = ui
             .painter()
             .layout_no_wrap("VhdxDock".into(), egui::FontId::proportional(27.0), TEXT)
@@ -519,7 +543,7 @@ impl DockApp {
             Vec2::new(ui.available_width(), brand_height.max(50.0)),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                brand_icon(ui);
+                brand_icon(ui, brand_texture);
                 ui.vertical(|ui| {
                     ui.heading(RichText::new("VhdxDock").size(27.0).color(TEXT));
                     ui.label(RichText::new("镜像归档 · 本地差分 · 随时接入").color(MUTED));
@@ -1559,22 +1583,14 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, enabled: bool, tooltip: &str) -> e
     .inner
 }
 
-fn brand_icon(ui: &mut egui::Ui) {
+fn brand_icon(ui: &mut egui::Ui, texture: &egui::TextureHandle) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(50.0), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 11.0, ACCENT);
-    let center = rect.center();
-    for offset in [-9.0, 1.0, 11.0] {
-        let points = vec![
-            center + Vec2::new(-14.0, offset - 3.0),
-            center + Vec2::new(0.0, offset - 9.0),
-            center + Vec2::new(14.0, offset - 3.0),
-            center + Vec2::new(0.0, offset + 3.0),
-        ];
-        ui.painter().add(egui::Shape::closed_line(
-            points,
-            Stroke::new(1.6_f32, Color32::WHITE),
-        ));
-    }
+    ui.painter().image(
+        texture.id(),
+        rect,
+        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        Color32::WHITE,
+    );
 }
 
 fn install_style(ctx: &egui::Context) {
