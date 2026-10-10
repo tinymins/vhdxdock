@@ -93,12 +93,11 @@ mod implementation {
         for (index, ancestor) in folder.ancestors().enumerate() {
             let metadata = std::fs::symlink_metadata(ancestor)
                 .with_context(|| format!("挂载文件夹必须已存在：{}", ancestor.display()))?;
-            if !metadata.is_dir() {
-                bail!("挂载目标及其父路径必须是目录")
-            }
-            if metadata.file_attributes() & 0x400 != 0 && !(index == 0 && already_mounted_here) {
-                bail!("挂载文件夹或父目录是重解析点，不能作为挂载目标")
-            }
+            validate_folder_entry(
+                ancestor,
+                metadata.file_attributes(),
+                index == 0 && already_mounted_here,
+            )?;
         }
         let text = wide_path(parent)?;
         let mut host = [0u16; 32768];
@@ -128,6 +127,24 @@ mod implementation {
         }
         if !already_mounted_here && std::fs::read_dir(folder)?.next().transpose()?.is_some() {
             bail!("挂载文件夹必须为空；不会删除已有内容")
+        }
+        Ok(())
+    }
+    fn validate_folder_entry(path: &Path, attributes: u32, trusted_mount_leaf: bool) -> Result<()> {
+        // FileType::is_dir() can be false for a directory reparse entry.
+        // Only the trusted final mount point may carry REPARSE_POINT; all
+        // entries must still carry Windows' DIRECTORY attribute.
+        if attributes & 0x10 == 0 {
+            bail!(
+                "挂载目标及其父路径必须是目录：{}（属性 0x{attributes:x}）",
+                path.display()
+            )
+        }
+        if attributes & 0x400 != 0 && !trusted_mount_leaf {
+            bail!(
+                "挂载文件夹或父目录是重解析点，不能作为挂载目标：{}（属性 0x{attributes:x}）",
+                path.display()
+            )
         }
         Ok(())
     }
@@ -382,6 +399,9 @@ if ($req.folder) {
 }
 $first = $true
 foreach ($p in $eligible) {
+    # Folder mode persists this GPT attribute in the child. Restore normal
+    # drive-letter behavior when switching the same child back to letter mode.
+    if ($disk.PartitionStyle -eq 'GPT' -and $p.NoDefaultDriveLetter) { $p | Set-Partition -NoDefaultDriveLetter $false -ErrorAction Stop }
     if ($first -and $req.letter) {
         $letter = [char][string]$req.letter
         if ($p.DriveLetter -and $p.DriveLetter -ne $letter) { throw '磁盘已有其他盘符，请先卸载后重试' }
@@ -806,6 +826,16 @@ ConvertTo-Json -InputObject @{uniqueId=[string]$disk.UniqueId} -Compress
     mod tests {
         use super::*;
         #[test]
+        fn directory_mount_entry_is_allowed_only_for_trusted_final_component() {
+            let path = Path::new(r"C:\mounts\fixture");
+            assert!(validate_folder_entry(path, 0x10, false).is_ok());
+            assert!(validate_folder_entry(path, 0x410, true).is_ok());
+            assert!(validate_folder_entry(path, 0x410, false).is_err());
+            let error = validate_folder_entry(path, 0x400, true).unwrap_err();
+            assert!(error.to_string().contains(r"C:\mounts\fixture"));
+            assert!(error.to_string().contains("0x400"));
+        }
+        #[test]
         fn folder_and_letter_conflict_is_rejected_before_image_access() {
             let error = mount(MountRequest {
                 base: "missing-base.vhdx".into(),
@@ -928,6 +958,26 @@ function Remove-PartitionAccessPath { param($AccessPath) if ($AccessPath -ne 'F:
                 .iter()
                 .all(|p| p.as_str() != Some(r"F:\")));
             assert!(process::powershell(&script, &request(2)).is_err());
+        }
+        #[test]
+        fn drive_assignment_clears_persisted_folder_mode_attribute_before_assigning_letter() {
+            let mock = r#"
+function Get-Disk { [pscustomobject]@{Number=999;IsBoot=$false;IsSystem=$false;IsReadOnly=$false;IsOffline=$false;PartitionStyle='GPT'} }
+function Get-Partition {
+    [pscustomobject]@{PartitionNumber=2;Type='Basic';IsBoot=$false;IsSystem=$false;DriveLetter=$(if ($script:assigned) {'F'} else {$null});NoDefaultDriveLetter=(-not $script:cleared);AccessPaths=@('\\?\Volume{fixture}\')}
+}
+function Get-Volume { [pscustomobject]@{FileSystemType='NTFS'} }
+function Set-Partition { param($NoDefaultDriveLetter) if ($NoDefaultDriveLetter -ne $false) { throw 'must clear persisted folder-mode attribute' }; $script:cleared=$true }
+function Add-PartitionAccessPath {
+    param([switch]$AssignDriveLetter)
+    if (-not $AssignDriveLetter -or -not $script:cleared) { throw 'drive letter assigned before clearing folder-mode attribute' }
+    $script:assigned=$true
+}
+"#;
+            let script = format!("{mock}\n{ASSIGN_VOLUMES}");
+            let value =
+                process::powershell(&script, &json!({"physical":r"\\.\PhysicalDrive999"})).unwrap();
+            assert_eq!(value["partitions"][0]["DriveLetter"], "F");
         }
         #[test]
         fn discovery_letter_fallback_requires_an_accessible_root() {

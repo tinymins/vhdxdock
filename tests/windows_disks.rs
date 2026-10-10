@@ -402,7 +402,8 @@ fn scratch_folder_mount_is_persistent_and_cleans_its_mount_point() -> Result<()>
     enable_test()?;
     let mut scratch = Scratch::new()?;
     ensure_ntfs_scratch(scratch.dir.path())?;
-    let base = create_independent_base(&mut scratch, "folder-base", b"folder immutable base")?;
+    let base = create_independent_base(&mut scratch, "folder-base", b"folder immutable base")
+        .context("folder lifecycle: create first scratch base")?;
     let diff = scratch.image("folder-diff.vhdx");
     let base_hash = digest(&base)?;
     let folder = scratch.dir.path().join("挂载目录 ' $ 中文");
@@ -428,7 +429,7 @@ fn scratch_folder_mount_is_persistent_and_cleans_its_mount_point() -> Result<()>
         drive_letter: None,
         mount_folder: Some(folder.clone()),
     };
-    let rows = backend::mount(request())?;
+    let rows = backend::mount(request()).context("folder lifecycle: first folder mount")?;
     let row = rows
         .iter()
         .find(|row| paths::same_path(&row.image_path, &diff))
@@ -447,7 +448,8 @@ fn scratch_folder_mount_is_persistent_and_cleans_its_mount_point() -> Result<()>
     assert_no_scratch_drive_letters(&diff)?;
     fs::write(folder.join("folder-only.txt"), b"persistent folder overlay")?;
     let device = virtual_disk::physical_path(&diff)?;
-    let repeated = backend::mount(request())?;
+    let repeated =
+        backend::mount(request()).context("folder lifecycle: repeat same folder mount")?;
     assert_eq!(virtual_disk::physical_path(&diff)?, device);
     assert_eq!(
         repeated
@@ -483,7 +485,8 @@ fn scratch_folder_mount_is_persistent_and_cleans_its_mount_point() -> Result<()>
 
     // An independently initialized second image avoids duplicate GPT IDs and
     // proves ejecting a folder mount does not affect another folder volume.
-    let base_b = create_independent_base(&mut scratch, "folder-base-b", b"second folder base")?;
+    let base_b = create_independent_base(&mut scratch, "folder-base-b", b"second folder base")
+        .context("folder lifecycle: create independent second base")?;
     let hash_b = digest(&base_b)?;
     let diff_b = scratch.image("folder-diff-b.vhdx");
     let folder_b = scratch.dir.path().join("independent folder B");
@@ -493,7 +496,8 @@ fn scratch_folder_mount_is_persistent_and_cleans_its_mount_point() -> Result<()>
         diff: diff_b.clone(),
         drive_letter: None,
         mount_folder: Some(folder_b.clone()),
-    })?;
+    })
+    .context("folder lifecycle: mount independent second folder")?;
     let device_b = virtual_disk::physical_path(&diff_b)?;
     assert_ne!(device, device_b);
     assert_no_scratch_drive_letters(&diff_b)?;
@@ -513,7 +517,8 @@ fn scratch_folder_mount_is_persistent_and_cleans_its_mount_point() -> Result<()>
         b"persistent folder overlay"
     );
     drop(busy);
-    backend::unmount(&diff)?;
+    backend::unmount(&diff)
+        .context("folder lifecycle: first clean unmount after dropping busy handle")?;
     assert_empty_ordinary_directory(&folder)?;
     assert_eq!(digest(&base)?, base_hash);
     assert_eq!(virtual_disk::physical_path(&diff_b)?, device_b);
@@ -533,7 +538,8 @@ fn scratch_folder_mount_is_persistent_and_cleans_its_mount_point() -> Result<()>
         diff: diff.clone(),
         drive_letter: None,
         mount_folder: None,
-    })?;
+    })
+    .context("folder lifecycle: switch from folder to automatic drive letter")?;
     let letter_root = mounted_root(&diff)?;
     let letter_text = letter_root.to_string_lossy();
     let letter_bytes = letter_text.as_bytes();
@@ -554,9 +560,10 @@ fn scratch_folder_mount_is_persistent_and_cleans_its_mount_point() -> Result<()>
         b"writes after folder to letter switch",
     )?;
     assert_empty_ordinary_directory(&folder)?;
-    backend::unmount(&diff)?;
+    backend::unmount(&diff).context("folder lifecycle: unmount automatic drive letter")?;
     assert_eq!(digest(&base)?, base_hash);
-    backend::mount(request())?;
+    backend::mount(request())
+        .context("folder lifecycle: remount original folder after drive-letter mode")?;
     assert_no_scratch_drive_letters(&diff)?;
     assert_eq!(
         fs::read(folder.join("folder-only.txt"))?,
@@ -568,7 +575,7 @@ fn scratch_folder_mount_is_persistent_and_cleans_its_mount_point() -> Result<()>
         "switching back to folder mode lost writes made through the drive letter"
     );
     fs::write(folder.join("after-remount.txt"), b"folder remains writable")?;
-    backend::unmount(&diff)?;
+    backend::unmount(&diff).context("folder lifecycle: final unmount of first folder")?;
     assert_empty_ordinary_directory(&folder)?;
     assert_eq!(digest(&base)?, base_hash);
     assert_eq!(virtual_disk::physical_path(&diff_b)?, device_b);
@@ -576,7 +583,8 @@ fn scratch_folder_mount_is_persistent_and_cleans_its_mount_point() -> Result<()>
         fs::read(folder_b.join("after-a-eject.txt"))?,
         b"second folder stays writable"
     );
-    backend::unmount(&diff_b)?;
+    backend::unmount(&diff_b)
+        .context("folder lifecycle: final unmount of independent second folder")?;
     assert_empty_ordinary_directory(&folder_b)?;
     assert_eq!(digest(&base_b)?, hash_b);
 
