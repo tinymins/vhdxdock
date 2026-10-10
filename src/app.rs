@@ -20,6 +20,7 @@ const TEXT: Color32 = Color32::from_rgb(30, 44, 60);
 const MUTED: Color32 = Color32::from_rgb(100, 116, 139);
 const BORDER: Color32 = Color32::from_rgb(221, 228, 235);
 const CARD_PADDING: i8 = 18;
+const CONTROL_HEIGHT: f32 = 34.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Tab {
@@ -507,22 +508,33 @@ impl DockApp {
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            brand_icon(ui);
-            ui.vertical(|ui| {
-                ui.heading(RichText::new("VhdxDock").size(27.0).color(TEXT));
-                ui.label(RichText::new("镜像归档 · 本地差分 · 随时接入").color(MUTED));
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    RichText::new("WINDOWS  /  VHD + VHDX")
-                        .size(11.0)
-                        .color(MUTED),
-                );
-            });
-        });
+        let brand_height = ui
+            .painter()
+            .layout_no_wrap("VhdxDock".into(), egui::FontId::proportional(27.0), TEXT)
+            .size()
+            .y
+            + ui.text_style_height(&egui::TextStyle::Body)
+            + ui.spacing().item_spacing.y;
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), brand_height.max(50.0)),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                brand_icon(ui);
+                ui.vertical(|ui| {
+                    ui.heading(RichText::new("VhdxDock").size(27.0).color(TEXT));
+                    ui.label(RichText::new("镜像归档 · 本地差分 · 随时接入").color(MUTED));
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new("WINDOWS  /  VHD + VHDX")
+                            .size(11.0)
+                            .color(MUTED),
+                    );
+                });
+            },
+        );
         ui.add_space(18.0);
-        ui.horizontal(|ui| {
+        control_row(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             for (tab, title) in [(Tab::Mount, "挂载镜像"), (Tab::Build, "制作镜像")] {
                 if tab_button(ui, title, self.tab == tab).clicked() {
@@ -568,19 +580,19 @@ impl DockApp {
                         .unwrap_or_else(|_| "选择基础镜像后自动生成".into());
                     ui.label(RichText::new(preview).size(12.0).color(MUTED));
                 });
-                ui.horizontal(|ui| {
+                control_row(ui, |ui| {
                     ui.label(
                         RichText::new("相对路径以软件所在目录为起点")
                             .size(12.0)
                             .color(MUTED),
                     );
-                    if ui.small_button("恢复默认差分路径").clicked() {
+                    if ui.add(button("恢复默认差分路径")).clicked() {
                         self.diff_manual = false;
                         self.set_default_diff();
                     }
                 });
                 ui.add_space(13.0);
-                ui.horizontal(|ui| {
+                control_row(ui, |ui| {
                     ui.label("盘符");
                     let old_letter = self.settings.drive_letter;
                     let selected = self
@@ -641,11 +653,11 @@ impl DockApp {
                 ui.label(RichText::new(format!("{} 条", self.logs.len())).color(MUTED));
             });
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.small_button("清空显示").clicked() {
+            control_row(ui, |ui| {
+                if ui.add(button("清空显示")).clicked() {
                     self.logs.clear();
                 }
-                if ui.small_button("打开日志目录").clicked() {
+                if ui.add(button("打开日志目录")).clicked() {
                     self.open_path(config::data_dir().join("logs").display().to_string());
                 }
             });
@@ -701,12 +713,12 @@ impl DockApp {
         let mut open = None;
         let mut eject = None;
         card(ui, |ui| {
-            ui.horizontal(|ui| {
+            control_row(ui, |ui| {
                 ui.label(RichText::new("已挂载镜像").strong().size(17.0));
                 ui.label(RichText::new(format!("{} 个", self.disks.len())).color(MUTED));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .add_enabled(self.disk_busy.is_none(), egui::Button::new("刷新"))
+                        .add_enabled(self.disk_busy.is_none(), button("刷新"))
                         .clicked()
                     {
                         self.refresh();
@@ -787,32 +799,39 @@ impl DockApp {
                                     .unwrap_or_else(|| "直接挂载".into()),
                                 path_width,
                             );
-                            ui.horizontal(|ui| {
-                                if icon_button(
-                                    ui,
-                                    Icon::Folder,
-                                    !disk.volumes.is_empty(),
-                                    "打开磁盘",
-                                )
-                                .clicked()
-                                {
-                                    open = Some(disk.volumes.clone());
-                                }
-                                if icon_button(
-                                    ui,
-                                    Icon::Eject,
-                                    disk.can_eject && self.disk_busy.is_none(),
-                                    if disk.can_eject {
-                                        "卸载磁盘"
-                                    } else {
-                                        "此磁盘受保护，不能在此卸载"
-                                    },
-                                )
-                                .clicked()
-                                {
-                                    eject = Some(disk.clone());
-                                }
-                            });
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(
+                                    2.0 * CONTROL_HEIGHT + ui.spacing().item_spacing.x,
+                                    CONTROL_HEIGHT,
+                                ),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    if icon_button(
+                                        ui,
+                                        Icon::Folder,
+                                        !disk.volumes.is_empty(),
+                                        "打开磁盘",
+                                    )
+                                    .clicked()
+                                    {
+                                        open = Some(disk.volumes.clone());
+                                    }
+                                    if icon_button(
+                                        ui,
+                                        Icon::Eject,
+                                        disk.can_eject && self.disk_busy.is_none(),
+                                        if disk.can_eject {
+                                            "卸载磁盘"
+                                        } else {
+                                            "此磁盘受保护，不能在此卸载"
+                                        },
+                                    )
+                                    .clicked()
+                                    {
+                                        eject = Some(disk.clone());
+                                    }
+                                },
+                            );
                             ui.end_row();
                         }
                     });
@@ -836,12 +855,13 @@ impl DockApp {
 
     fn build_page(&mut self, ui: &mut egui::Ui) {
         card(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
             ui.label(RichText::new("将文件夹封装为基础镜像").strong().size(17.0));
             ui.label(
                 RichText::new("文件夹内容直接放在镜像根目录。制作期间请停止修改源文件。")
                     .color(MUTED),
             );
-            ui.add_space(15.0);
+            ui.add_space(10.0);
             ui.add_enabled_ui(!self.building, |ui| {
                 self.config_dirty |= path_input(
                     ui,
@@ -849,7 +869,7 @@ impl DockApp {
                     &mut self.settings.source_path,
                     Browse::Folder,
                 );
-                ui.add_space(10.0);
+                ui.add_space(8.0);
                 self.config_dirty |= path_input(
                     ui,
                     "输出镜像",
@@ -863,12 +883,14 @@ impl DockApp {
                     .size(12.0)
                     .color(MUTED),
                 );
-                ui.add_space(10.0);
+                ui.add_space(6.0);
                 ui.label(RichText::new("卷标").strong().size(13.0));
                 self.config_dirty |= ui
                     .add_sized(
-                        [ui.available_width(), 34.0],
+                        [ui.available_width(), CONTROL_HEIGHT],
                         egui::TextEdit::singleline(&mut self.settings.volume_label)
+                            .vertical_align(egui::Align::Center)
+                            .min_size(Vec2::new(0.0, CONTROL_HEIGHT))
                             .hint_text("留空使用输出镜像文件名（去掉 .vhdx）"),
                     )
                     .changed();
@@ -909,8 +931,8 @@ impl DockApp {
                     )
                     .on_hover_text("大多数汉字和字母计为 1 个；部分符号（如 emoji）计为 2 个。");
                 });
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
+                ui.add_space(6.0);
+                control_row(ui, |ui| {
                     ui.label("虚拟容量");
                     self.config_dirty |= ui
                         .add(
@@ -930,8 +952,8 @@ impl DockApp {
                         .size(12.0)
                         .color(MUTED),
                 );
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
+                ui.add_space(6.0);
+                control_row(ui, |ui| {
                     ui.label("校验方式");
                     let old_verify = self.settings.verify;
                     egui::ComboBox::from_id_salt("verify_mode")
@@ -964,8 +986,8 @@ impl DockApp {
                     .color(MUTED),
                 );
             });
-            ui.add_space(17.0);
-            ui.horizontal(|ui| {
+            ui.add_space(10.0);
+            control_row(ui, |ui| {
                 if ui
                     .add_enabled(
                         !self.building
@@ -982,12 +1004,12 @@ impl DockApp {
                 if ui
                     .add_enabled(
                         self.building && !cancelling,
-                        egui::Button::new(if cancelling && self.building {
+                        button(if cancelling && self.building {
                             "正在取消…"
                         } else {
                             "取消"
                         })
-                        .min_size(Vec2::new(85.0, 36.0)),
+                        .min_size(Vec2::new(85.0, CONTROL_HEIGHT)),
                     )
                     .clicked()
                 {
@@ -1071,7 +1093,7 @@ impl DockApp {
                             .size(11.0)
                             .color(MUTED),
                     );
-                    if ui.button("填入挂载页面").clicked() {
+                    if ui.add(button("填入挂载页面")).clicked() {
                         self.settings.base_path = result.output.display().to_string();
                         self.diff_manual = false;
                         self.set_default_diff();
@@ -1093,14 +1115,14 @@ impl DockApp {
                 ui.label("可以返回继续等待，或取消制作并在后台清理完成后退出。");
                 ui.label(RichText::new("未完成镜像保留为 .partial，源文件不受影响。").color(MUTED));
                 ui.add_space(15.0);
-                ui.horizontal(|ui| {
-                    let response = ui.button("返回");
+                control_row(ui, |ui| {
+                    let response = ui.add(button("返回"));
                     if self.close_focus_cancel {
                         response.request_focus();
                         self.close_focus_cancel = false;
                     }
                     dismiss = response.clicked();
-                    cancel_and_exit = ui.button("取消制作并退出").clicked();
+                    cancel_and_exit = ui.add(button("取消制作并退出")).clicked();
                 });
             });
             if dismiss {
@@ -1136,8 +1158,8 @@ impl DockApp {
                 ui.add_space(10.0);
                 ui.label("卸载后已保存的修改仍保留，请先保存并关闭盘内文件。");
                 ui.add_space(16.0);
-                ui.horizontal(|ui| {
-                    let response = ui.button("取消");
+                control_row(ui, |ui| {
+                    let response = ui.add(button("取消"));
                     if confirmation.focus_cancel {
                         response.request_focus();
                         confirmation.focus_cancel = false;
@@ -1163,12 +1185,12 @@ impl DockApp {
                 ui.heading("选择要打开的卷");
                 ui.add_space(12.0);
                 for volume in volumes {
-                    if ui.button(volume).clicked() {
+                    if ui.add(button(volume)).clicked() {
                         chosen = Some(volume.clone());
                     }
                 }
                 ui.add_space(12.0);
-                dismiss = ui.button("取消").clicked();
+                dismiss = ui.add(button("取消")).clicked();
             });
             if let Some(volume) = chosen {
                 self.open_volumes = None;
@@ -1307,20 +1329,20 @@ impl eframe::App for DockApp {
 fn primary(label: &str, width: f32) -> egui::Button<'_> {
     egui::Button::new(RichText::new(label).color(Color32::WHITE))
         .fill(ACCENT)
-        .min_size(Vec2::new(width, 36.0))
+        .min_size(Vec2::new(width, CONTROL_HEIGHT))
         .corner_radius(6.0)
 }
 
 fn tab_button(ui: &mut egui::Ui, title: &str, selected: bool) -> egui::Response {
     ui.add(
-        egui::Button::new(RichText::new(title).size(15.0).color(if selected {
+        egui::Button::new(RichText::new(title).size(14.0).color(if selected {
             Color32::WHITE
         } else {
             TEXT
         }))
         .fill(if selected { ACCENT } else { Color32::WHITE })
         .stroke(Stroke::new(1.0_f32, if selected { ACCENT } else { BORDER }))
-        .min_size(Vec2::new(124.0, 38.0))
+        .min_size(Vec2::new(124.0, CONTROL_HEIGHT))
         .corner_radius(7.0),
     )
 }
@@ -1383,6 +1405,30 @@ fn card(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
         });
 }
 
+fn button(label: &str) -> egui::Button<'_> {
+    egui::Button::new(label).min_size(Vec2::new(0.0, CONTROL_HEIGHT))
+}
+
+/// Interactive rows know their height before the first label is placed. Keep
+/// this local so ordinary text-only rows retain their compact line spacing.
+fn control_row<R>(
+    ui: &mut egui::Ui,
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), CONTROL_HEIGHT),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            let text_height = ui
+                .text_style_height(&egui::TextStyle::Button)
+                .max(ui.spacing().icon_width);
+            ui.spacing_mut().interact_size.y = CONTROL_HEIGHT;
+            ui.spacing_mut().button_padding.y = ((CONTROL_HEIGHT - text_height) * 0.5).max(0.0);
+            content(ui)
+        },
+    )
+}
+
 enum Browse {
     Image,
     SaveDiff,
@@ -1393,20 +1439,23 @@ enum Browse {
 fn path_input(ui: &mut egui::Ui, label: &str, value: &mut String, kind: Browse) -> bool {
     ui.label(RichText::new(label).strong().size(13.0));
     let mut changed = false;
-    ui.horizontal(|ui| {
+    control_row(ui, |ui| {
         changed |= ui
             .add_sized(
-                [ui.available_width() - 70.0, 34.0],
-                egui::TextEdit::singleline(value).hint_text(match kind {
-                    Browse::Image => r"本地路径或 \\NAS\共享\镜像.vhdx",
-                    Browse::SaveDiff => r".\diffs\镜像-diff.vhdx",
-                    Browse::Folder => r"E:\需要归档的文件夹",
-                    Browse::SaveVhdx => r"D:\Backup\镜像-base.vhdx",
-                }),
+                [ui.available_width() - 70.0, CONTROL_HEIGHT],
+                egui::TextEdit::singleline(value)
+                    .vertical_align(egui::Align::Center)
+                    .min_size(Vec2::new(0.0, CONTROL_HEIGHT))
+                    .hint_text(match kind {
+                        Browse::Image => r"本地路径或 \\NAS\共享\镜像.vhdx",
+                        Browse::SaveDiff => r".\diffs\镜像-diff.vhdx",
+                        Browse::Folder => r"E:\需要归档的文件夹",
+                        Browse::SaveVhdx => r"D:\Backup\镜像-base.vhdx",
+                    }),
             )
             .changed();
         if ui
-            .add_sized([62.0, 34.0], egui::Button::new("浏览"))
+            .add_sized([62.0, CONTROL_HEIGHT], button("浏览"))
             .clicked()
         {
             let mut dialog = rfd::FileDialog::new();
@@ -1440,8 +1489,15 @@ fn path_input(ui: &mut egui::Ui, label: &str, value: &mut String, kind: Browse) 
 }
 
 fn truncated_path(ui: &mut egui::Ui, path: &str, width: f32) {
-    ui.add_sized([width, 23.0], egui::Label::new(path).truncate())
-        .on_hover_text(path);
+    ui.allocate_ui_with_layout(
+        Vec2::new(width, 23.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_min_width(width);
+            ui.add(egui::Label::new(path).truncate().halign(egui::Align::Min))
+                .on_hover_text(path);
+        },
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -1452,7 +1508,8 @@ enum Icon {
 
 fn icon_button(ui: &mut egui::Ui, icon: Icon, enabled: bool, tooltip: &str) -> egui::Response {
     ui.add_enabled_ui(enabled, |ui| {
-        let (rect, response) = ui.allocate_exact_size(Vec2::splat(32.0), egui::Sense::click());
+        let (rect, response) =
+            ui.allocate_exact_size(Vec2::splat(CONTROL_HEIGHT), egui::Sense::click());
         let color = if !enabled {
             Color32::from_rgb(183, 194, 204)
         } else if response.hovered() {
@@ -1910,30 +1967,39 @@ mod tests {
                 Vec2::new(width, 760.0),
             ));
             let output = ctx.run(raw, |ctx| {
+                egui::TopBottomPanel::bottom("status_bar")
+                    .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(24, 10)))
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("就绪");
+                        });
+                    });
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().inner_margin(24))
                     .show(ctx, |ui| {
                         app.header(ui);
-                        app.build_page(ui);
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            app.build_page(ui);
+                        });
                     });
             });
             let text = rendered_text(&output.shapes);
             assert!(text.contains("实际卷标：JX3Code-base"), "{text}");
             assert!(text.contains("最多 32 个 UTF-16 字符"), "{text}");
-            let button = output
+            let (button, clip) = output
                 .shapes
                 .iter()
                 .find_map(|clipped| match &clipped.shape {
                     egui::Shape::Text(shape) if shape.galley.job.text == "开始制作" => {
-                        Some(shape)
+                        Some((shape, clipped.clip_rect))
                     }
                     _ => None,
                 })
                 .expect("Start button must be rendered");
+            let button_bottom = button.pos.y + (button.galley.rect.height() + CONTROL_HEIGHT) * 0.5;
             assert!(
-                button.pos.y + button.galley.rect.height() < 720.0,
-                "Start button is clipped at window width {width}: y={}",
-                button.pos.y
+                button_bottom <= clip.bottom(),
+                "Start button is clipped at window width {width}: bottom={button_bottom}, clip={clip:?}"
             );
         }
     }
