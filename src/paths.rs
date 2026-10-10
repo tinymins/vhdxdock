@@ -65,7 +65,7 @@ pub fn default_diff(base: &Path) -> Result<PathBuf> {
         ImageFormat::Vhd => "-diff.vhd",
         ImageFormat::Vhdx => "-diff.vhdx",
     });
-    Ok(crate::config::exe_dir().join(name))
+    Ok(crate::config::exe_dir().join("diffs").join(name))
 }
 
 fn comparison_key(path: &Path) -> String {
@@ -149,10 +149,15 @@ mod tests {
         );
     }
     #[test]
-    fn old_vhd_diff_keeps_format() {
-        assert!(default_diff(Path::new("archive.vhd"))
-            .unwrap()
-            .ends_with("archive-diff.vhd"));
+    fn default_diff_uses_executable_subfolder_and_keeps_format() {
+        for extension in ["vhd", "vhdx"] {
+            assert_eq!(
+                default_diff(Path::new(&format!("archive.{extension}"))).unwrap(),
+                crate::config::exe_dir()
+                    .join("diffs")
+                    .join(format!("archive-diff.{extension}"))
+            );
+        }
     }
     #[test]
     fn rejects_unsupported() {

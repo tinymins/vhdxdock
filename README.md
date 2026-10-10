@@ -39,7 +39,7 @@ Windows 便携式 VHDX 镜像制作与 VHD/VHDX 差分挂载工具。
 ## 挂载 NAS 镜像
 
 1. 基础镜像填 `\\NAS\backup\JX3Code-base.vhdx`，推荐使用 UNC 地址而不是映射盘符。
-2. 差分默认 `.\JX3Code-base-diff.vhdx`，也可选择如 `D:\Diff\JX3Code-diff.vhdx`。
+2. 差分默认 `.\diffs\JX3Code-base-diff.vhdx`，也可选择如 `D:\Diff\JX3Code-diff.vhdx`。挂载时会自动创建缺失的目录；已保存的差分路径保持不变，点击恢复默认可使用新目录。
 3. 选择自动或指定盘符，点击 **挂载**。
 4. 在下方列表点击文件夹图标打开磁盘，点击弹出图标并确认后卸载。
 

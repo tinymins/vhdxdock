@@ -146,7 +146,7 @@ impl DockApp {
         install_style(ctx);
         let settings = AppConfig {
             base_path: r"\\NAS\archives\JX3Code-base.vhdx".into(),
-            diff_path: r"D:\VhdxDock\JX3Code-base-diff.vhdx".into(),
+            diff_path: r"D:\VhdxDock\diffs\JX3Code-base-diff.vhdx".into(),
             source_path: r"E:\X\E".into(),
             output_path: r"D:\Backup\JX3Code-base.vhdx".into(),
             ..Default::default()
@@ -155,7 +155,7 @@ impl DockApp {
         app.preview_mode = true;
         app.disks = vec![
             MountedImage {
-                image_path: PathBuf::from(r"D:\VhdxDock\JX3Code-base-diff.vhdx"),
+                image_path: PathBuf::from(r"D:\VhdxDock\diffs\JX3Code-base-diff.vhdx"),
                 parent_path: Some(PathBuf::from(r"\\NAS\archives\JX3Code-base.vhdx")),
                 volumes: vec![r"F:\".into()],
                 kind: "差分 VHDX".into(),
@@ -164,7 +164,7 @@ impl DockApp {
                 warning: None,
             },
             MountedImage {
-                image_path: PathBuf::from(r"D:\VhdxDock\Toolchain-diff.vhd"),
+                image_path: PathBuf::from(r"D:\VhdxDock\diffs\Toolchain-diff.vhd"),
                 parent_path: Some(PathBuf::from(r"\\NAS\archives\Toolchain.vhd")),
                 volumes: vec![r"G:\".into()],
                 kind: "差分 VHD".into(),
@@ -182,7 +182,7 @@ impl DockApp {
                 "VhdxDock 已启动",
                 "已刷新挂载列表：2 个镜像",
                 r"基础镜像：\\NAS\archives\JX3Code-base.vhdx",
-                r"本地差分：D:\VhdxDock\JX3Code-base-diff.vhdx",
+                r"本地差分：D:\VhdxDock\diffs\JX3Code-base-diff.vhdx",
                 "镜像已挂载，修改将保存在差分盘中",
             ]
             .into_iter()
@@ -1399,7 +1399,7 @@ fn path_input(ui: &mut egui::Ui, label: &str, value: &mut String, kind: Browse) 
                 [ui.available_width() - 70.0, 34.0],
                 egui::TextEdit::singleline(value).hint_text(match kind {
                     Browse::Image => r"本地路径或 \\NAS\共享\镜像.vhdx",
-                    Browse::SaveDiff => r".\镜像-diff.vhdx",
+                    Browse::SaveDiff => r".\diffs\镜像-diff.vhdx",
                     Browse::Folder => r"E:\需要归档的文件夹",
                     Browse::SaveVhdx => r"D:\Backup\镜像-base.vhdx",
                 }),
@@ -1952,7 +1952,10 @@ mod tests {
         assert_eq!(app.settings.diff_path, "custom/work.vhdx");
         app.diff_manual = false;
         app.set_default_diff();
-        assert!(app.settings.diff_path.ends_with("second-diff.vhdx"));
+        assert_eq!(
+            DockApp::resolved(&app.settings.diff_path).unwrap(),
+            config::exe_dir().join("diffs").join("second-diff.vhdx")
+        );
         let reloaded = DockApp::with_settings(app.settings);
         assert!(
             !reloaded.diff_manual,
