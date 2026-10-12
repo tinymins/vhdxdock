@@ -641,8 +641,10 @@ impl DockApp {
                         MountMode::DriveLetter,
                         "盘符",
                     )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .on_hover_text("自动分配空闲盘符，或选择指定盘符。");
                     ui.selectable_value(&mut self.settings.mount_mode, MountMode::Folder, "文件夹")
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
                         .on_hover_text("选择本地 NTFS 上已有的空文件夹；不会自动创建目录。\n仅支持单个数据分区，挂载后不保留盘符。");
                     self.config_dirty |= previous != self.settings.mount_mode;
                     if self.settings.mount_mode == MountMode::DriveLetter {
@@ -656,7 +658,8 @@ impl DockApp {
                             .selected_text(selected)
                             .width(85.0)
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.settings.drive_letter, None, "自动");
+                                ui.selectable_value(&mut self.settings.drive_letter, None, "自动")
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
                                 for letter in 'A'..='Z' {
                                     let used = self
                                         .disks
@@ -675,11 +678,11 @@ impl DockApp {
                                                     "{letter}:{}",
                                                     if used { "  已使用" } else { "" }
                                                 ),
-                                            );
+                                            ).on_hover_cursor(egui::CursorIcon::PointingHand);
                                         },
                                     );
                                 }
-                            });
+                            }).response.on_hover_cursor(egui::CursorIcon::PointingHand);
                         self.config_dirty |= old_letter != self.settings.drive_letter;
                     } else {
                         let input_width =
@@ -694,7 +697,7 @@ impl DockApp {
                                     .hint_text(r"D:\Mounts\Archive"),
                             )
                             .changed();
-                        if ui.add_sized([62.0, CONTROL_HEIGHT], button("浏览")).clicked() {
+                        if ui.add_sized([62.0, CONTROL_HEIGHT], button("浏览")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                             let mut dialog = rfd::FileDialog::new();
                             if let Ok(path) = Self::resolved(&self.settings.mount_folder) {
                                 if path.is_dir() {
@@ -717,7 +720,7 @@ impl DockApp {
                         if ui
                             .add_enabled(enabled, primary("挂载", 106.0))
                             .on_hover_text("差分镜像不存在时自动创建；已存在时继续使用。")
-                            .clicked()
+                            .on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
                         {
                             self.mount();
                         }
@@ -737,10 +740,18 @@ impl DockApp {
             });
             ui.add_space(8.0);
             control_row(ui, |ui| {
-                if ui.add(button("清空显示")).clicked() {
+                if ui
+                    .add(button("清空显示"))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
                     self.logs.clear();
                 }
-                if ui.add(button("打开日志目录")).clicked() {
+                if ui
+                    .add(button("打开日志目录"))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
                     self.open_path(config::data_dir().join("logs").display().to_string());
                 }
             });
@@ -802,6 +813,7 @@ impl DockApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .add_enabled(self.disk_busy.is_none(), button("刷新"))
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
                         .clicked()
                     {
                         self.refresh();
@@ -1044,17 +1056,24 @@ impl DockApp {
                 ui.add_space(6.0);
                 control_row(ui, |ui| {
                     ui.label("虚拟容量");
-                    self.config_dirty |= ui
-                        .add(
+                    let capacity = ui.add(
                             egui::DragValue::new(&mut self.settings.capacity_gib)
                                 .range(1..=65_536)
                                 .speed(16.0)
                                 .suffix(" GiB"),
-                        )
-                        .changed();
+                        );
+                    self.config_dirty |= capacity.changed();
+                    // DragValue switches to a TextEdit when it owns focus.
+                    let cursor = if capacity.has_focus() {
+                        egui::CursorIcon::Text
+                    } else {
+                        egui::CursorIcon::PointingHand
+                    };
+                    capacity.on_hover_and_drag_cursor(cursor);
                     ui.add_space(20.0);
                     self.config_dirty |= ui
                         .checkbox(&mut self.settings.compress, "NTFS 压缩")
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
                         .changed();
                 });
                 ui.label(
@@ -1077,13 +1096,13 @@ impl DockApp {
                                 &mut self.settings.verify,
                                 VerifyMode::Metadata,
                                 "文件信息比较",
-                            );
+                            ).on_hover_cursor(egui::CursorIcon::PointingHand);
                             ui.selectable_value(
                                 &mut self.settings.verify,
                                 VerifyMode::Sha256,
                                 "文件内容 SHA-256",
-                            );
-                        });
+                            ).on_hover_cursor(egui::CursorIcon::PointingHand);
+                        }).response.on_hover_cursor(egui::CursorIcon::PointingHand);
                     self.config_dirty |= old_verify != self.settings.verify;
                 });
                 ui.label(
@@ -1106,6 +1125,7 @@ impl DockApp {
                             && !self.settings.output_path.trim().is_empty(),
                         primary("开始制作", 124.0),
                     )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked()
                 {
                     self.start_build();
@@ -1121,6 +1141,7 @@ impl DockApp {
                         })
                         .min_size(Vec2::new(85.0, CONTROL_HEIGHT)),
                     )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked()
                 {
                     self.cancel.store(true, Ordering::Relaxed);
@@ -1203,7 +1224,11 @@ impl DockApp {
                             .size(11.0)
                             .color(MUTED),
                     );
-                    if ui.add(button("填入挂载页面")).clicked() {
+                    if ui
+                        .add(button("填入挂载页面"))
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
                         self.settings.base_path = result.output.display().to_string();
                         self.sync_diff_with_base();
                         self.tab = Tab::Mount;
@@ -1230,8 +1255,13 @@ impl DockApp {
                         response.request_focus();
                         self.close_focus_cancel = false;
                     }
-                    dismiss = response.clicked();
-                    cancel_and_exit = ui.add(button("取消制作并退出")).clicked();
+                    dismiss = response
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked();
+                    cancel_and_exit = ui
+                        .add(button("取消制作并退出"))
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked();
                 });
             });
             if dismiss {
@@ -1331,6 +1361,7 @@ impl DockApp {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             confirm = ui
                                 .add_enabled(self.disk_busy.is_none(), primary("卸载镜像", 100.0))
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
                                 .clicked();
                             let response = ui.add_sized(
                                 [80.0, CONTROL_HEIGHT],
@@ -1342,7 +1373,9 @@ impl DockApp {
                                 response.request_focus();
                                 confirmation.focus_cancel = false;
                             }
-                            dismiss = response.clicked();
+                            dismiss = response
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked();
                         });
                     });
                 });
@@ -1361,12 +1394,19 @@ impl DockApp {
                 ui.heading("选择要打开的卷");
                 ui.add_space(12.0);
                 for volume in volumes {
-                    if ui.add(button(volume).wrap()).clicked() {
+                    if ui
+                        .add(button(volume).wrap())
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
                         chosen = Some(volume.clone());
                     }
                 }
                 ui.add_space(12.0);
-                dismiss = ui.add(button("取消")).clicked();
+                dismiss = ui
+                    .add(button("取消"))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked();
             });
             if let Some(volume) = chosen {
                 self.open_volumes = None;
@@ -1519,6 +1559,7 @@ fn tab_button(ui: &mut egui::Ui, title: &str, selected: bool) -> egui::Response 
         .min_size(Vec2::new(124.0, CONTROL_HEIGHT))
         .corner_radius(7.0),
     )
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 fn start_log_writer() -> mpsc::Sender<LogCommand> {
@@ -1630,6 +1671,7 @@ fn path_input(ui: &mut egui::Ui, label: &str, value: &mut String, kind: Browse) 
             .changed();
         if ui
             .add_sized([62.0, CONTROL_HEIGHT], button("浏览"))
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked()
         {
             let mut dialog = rfd::FileDialog::new();
@@ -1727,7 +1769,9 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, enabled: bool, tooltip: &str) -> e
                 );
             }
         }
-        response.on_hover_text(tooltip)
+        response
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(tooltip)
     })
     .inner
 }
