@@ -617,17 +617,6 @@ impl DockApp {
                         .unwrap_or_else(|_| "选择基础镜像后自动生成".into());
                     ui.label(RichText::new(preview).size(12.0).color(MUTED));
                 });
-                control_row(ui, |ui| {
-                    ui.label(
-                        RichText::new("相对路径以软件所在目录为起点")
-                            .size(12.0)
-                            .color(MUTED),
-                    );
-                    if ui.add(button("恢复默认差分路径")).clicked() {
-                        self.diff_manual = false;
-                        self.set_default_diff();
-                    }
-                });
                 ui.add_space(13.0);
                 ui.label(RichText::new("挂载位置").strong().size(13.0));
                 control_row(ui, |ui| {
