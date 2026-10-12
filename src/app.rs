@@ -820,16 +820,71 @@ impl DockApp {
                 ui.add_space(20.0);
             } else {
                 let available = ui.available_width();
-                let location_width = (available * 0.22).clamp(110.0, 180.0);
                 let actions_width = 2.0 * CONTROL_HEIGHT + ui.spacing().item_spacing.x;
-                let path_width =
-                    ((available - location_width - actions_width - 36.0) / 2.0).max(100.0);
+                let headers = ["挂载点", "基础镜像", "差分镜像", "操作"];
+                let measure = |text: String, font| {
+                    ui.painter()
+                        .layout_no_wrap(text, font, TEXT)
+                        .size()
+                        .x
+                        .ceil()
+                        + 2.0
+                };
+                let mut desired: [f32; 3] = std::array::from_fn(|column| {
+                    measure(headers[column].into(), egui::FontId::proportional(12.0))
+                });
+                let font = egui::TextStyle::Body.resolve(ui.style());
+                for disk in &self.disks {
+                    let values = [
+                        if disk.volumes.is_empty() {
+                            "—".into()
+                        } else {
+                            disk.volumes.join("  ")
+                        },
+                        disk.parent_path
+                            .as_ref()
+                            .unwrap_or(&disk.image_path)
+                            .display()
+                            .to_string(),
+                        if disk.parent_path.is_some() {
+                            disk.image_path.display().to_string()
+                        } else {
+                            "—".into()
+                        },
+                    ];
+                    for (column, value) in values.into_iter().enumerate() {
+                        desired[column] = desired[column].max(measure(value, font.clone()));
+                    }
+                }
+                // Keep short columns at their natural width. Under pressure,
+                // reserve readable space before sharing the rest by demand.
+                let budget = (available - actions_width - 3.0 * 12.0 - 2.0).max(0.0);
+                let minimum = desired.map(|width| width.min(100.0));
+                let minimum_total: f32 = minimum.iter().sum();
+                let desired_total: f32 = desired.iter().sum();
+                let widths = if desired_total <= budget {
+                    let extra = budget - desired_total;
+                    let path_total = desired[1] + desired[2];
+                    [
+                        desired[0],
+                        desired[1] + extra * desired[1] / path_total,
+                        desired[2] + extra * desired[2] / path_total,
+                    ]
+                } else if minimum_total < budget {
+                    let fraction = (budget - minimum_total) / (desired_total - minimum_total);
+                    std::array::from_fn(|column| {
+                        minimum[column] + (desired[column] - minimum[column]) * fraction
+                    })
+                } else {
+                    minimum.map(|width| width * budget / minimum_total)
+                };
                 egui::Grid::new("mounted_images")
                     .num_columns(4)
+                    .min_col_width(0.0)
                     .spacing([12.0, 12.0])
                     .striped(true)
                     .show(ui, |ui| {
-                        for header in ["挂载点", "基础镜像", "差分镜像", "操作"] {
+                        for header in headers {
                             ui.label(RichText::new(header).size(12.0).color(MUTED));
                         }
                         ui.end_row();
@@ -841,7 +896,7 @@ impl DockApp {
                                 } else {
                                     disk.volumes.join("  ")
                                 },
-                                location_width,
+                                widths[0],
                             );
                             truncated_path(
                                 ui,
@@ -851,7 +906,7 @@ impl DockApp {
                                     .unwrap_or(&disk.image_path)
                                     .display()
                                     .to_string(),
-                                path_width,
+                                widths[1],
                             );
                             truncated_path(
                                 ui,
@@ -860,13 +915,10 @@ impl DockApp {
                                 } else {
                                     "—".into()
                                 },
-                                path_width,
+                                widths[2],
                             );
                             ui.allocate_ui_with_layout(
-                                Vec2::new(
-                                    2.0 * CONTROL_HEIGHT + ui.spacing().item_spacing.x,
-                                    CONTROL_HEIGHT,
-                                ),
+                                Vec2::new(actions_width, CONTROL_HEIGHT),
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
                                     if icon_button(
@@ -1557,8 +1609,7 @@ fn truncated_path(ui: &mut egui::Ui, path: &str, width: f32) {
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
             ui.set_min_width(width);
-            ui.add(egui::Label::new(path).truncate().halign(egui::Align::Min))
-                .on_hover_text(path);
+            ui.add(egui::Label::new(path).truncate().halign(egui::Align::Min));
         },
     );
 }
@@ -2024,6 +2075,16 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| app.mounted_list(ui));
         });
         assert!(text_rect(&output.shapes, "操作").right() < 860.0);
+        assert!(
+            text_rect(&output.shapes, "操作").left() + 2.0 * CONTROL_HEIGHT + 8.0 < 840.0,
+            "Both action icons must remain inside the narrow window"
+        );
+        assert!(
+            text_rect(&output.shapes, "基础镜像").left()
+                - text_rect(&output.shapes, "挂载点").left()
+                > 180.0,
+            "A long folder mount should receive more than the former fixed column limit"
+        );
         assert!(rendered_text(&output.shapes).contains("挂载点"));
         app.eject = Some(EjectConfirmation {
             image: mounted,
@@ -2065,6 +2126,22 @@ mod tests {
         assert!(text.contains("G:\\"), "{text}");
         assert!(text.contains(r"D:\Diff\alpha.vhdx"), "{text}");
         assert!(text.contains(r"\\NAS\backup\beta.vhdx"), "{text}");
+        let mount_header = text_rect(&output.shapes, "挂载点");
+        let base_header = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(shape) if shape.galley.job.text == "基础镜像" => {
+                    Some(shape.pos.x)
+                }
+                _ => None,
+            })
+            .next_back()
+            .unwrap();
+        assert!(
+            base_header - mount_header.left() < 100.0,
+            "Short drive-letter mounts should not reserve a large empty column"
+        );
     }
 
     #[test]
