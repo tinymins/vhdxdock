@@ -1336,7 +1336,7 @@ impl DockApp {
                                 [80.0, CONTROL_HEIGHT],
                                 button("取消")
                                     .fill(Color32::WHITE)
-                                    .stroke(Stroke::new(1.0, BORDER)),
+                                    .stroke(Stroke::new(1.0_f32, BORDER)),
                             );
                             if confirmation.focus_cancel {
                                 response.request_focus();
@@ -1749,7 +1749,7 @@ fn eject_warning_icon(ui: &mut egui::Ui) {
         .circle_filled(center, 10.0, Color32::from_rgb(238, 159, 35));
     ui.painter().line_segment(
         [center + Vec2::new(0.0, -5.0), center + Vec2::new(0.0, 1.0)],
-        Stroke::new(2.0, Color32::WHITE),
+        Stroke::new(2.0_f32, Color32::WHITE),
     );
     ui.painter()
         .circle_filled(center + Vec2::new(0.0, 5.0), 1.2, Color32::WHITE);
