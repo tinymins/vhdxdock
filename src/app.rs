@@ -1251,42 +1251,101 @@ impl DockApp {
         if let Some(confirmation) = &mut self.eject {
             let mut dismiss = false;
             let mut confirm = false;
-            egui::Modal::new(egui::Id::new("eject_confirmation")).show(ctx, |ui| {
-                ui.set_width(460.0);
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(format!(
-                            "确认卸载 {}？",
-                            if confirmation.image.volumes.is_empty() {
-                                "此镜像".into()
-                            } else {
-                                confirmation.image.volumes.join("、")
+            egui::Modal::new(egui::Id::new("eject_confirmation"))
+                .frame(
+                    egui::Frame::new()
+                        .fill(Color32::WHITE)
+                        .corner_radius(12.0)
+                        .inner_margin(24)
+                        .shadow(egui::epaint::Shadow {
+                            offset: [0, 8],
+                            blur: 24,
+                            spread: 0,
+                            color: Color32::from_black_alpha(30),
+                        }),
+                )
+                .show(ctx, |ui| {
+                    ui.set_width(432.0);
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(ui.available_width(), 26.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.spacing_mut().item_spacing.x = 12.0;
+                            eject_warning_icon(ui);
+                            ui.label(
+                                RichText::new("确认卸载镜像？")
+                                    .size(18.0)
+                                    .strong()
+                                    .color(TEXT),
+                            );
+                        },
+                    );
+                    ui.add_space(10.0);
+                    egui::Frame::new()
+                        .inner_margin(egui::Margin {
+                            left: 34,
+                            right: 0,
+                            top: 0,
+                            bottom: 0,
+                        })
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.spacing_mut().item_spacing.y = 4.0;
+                            ui.label(
+                                RichText::new("请先保存并关闭盘内文件。")
+                                    .size(14.0)
+                                    .color(TEXT),
+                            );
+                            ui.label(
+                                RichText::new("已保存的修改仍会保留。")
+                                    .size(14.0)
+                                    .color(MUTED),
+                            );
+                            ui.add_space(12.0);
+                            egui::Frame::new()
+                                .fill(Color32::from_rgb(245, 247, 250))
+                                .corner_radius(6.0)
+                                .inner_margin(12)
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    eject_path_field(
+                                        ui,
+                                        "挂载点",
+                                        &if confirmation.image.volumes.is_empty() {
+                                            "—".into()
+                                        } else {
+                                            confirmation.image.volumes.join("、")
+                                        },
+                                    );
+                                    ui.add_space(8.0);
+                                    eject_path_field(
+                                        ui,
+                                        "挂载镜像",
+                                        &confirmation.image.image_path.display().to_string(),
+                                    );
+                                });
+                        });
+                    ui.add_space(24.0);
+                    control_row(ui, |ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            confirm = ui
+                                .add_enabled(self.disk_busy.is_none(), primary("卸载镜像", 100.0))
+                                .clicked();
+                            let response = ui.add_sized(
+                                [80.0, CONTROL_HEIGHT],
+                                button("取消")
+                                    .fill(Color32::WHITE)
+                                    .stroke(Stroke::new(1.0, BORDER)),
+                            );
+                            if confirmation.focus_cancel {
+                                response.request_focus();
+                                confirmation.focus_cancel = false;
                             }
-                        ))
-                        .heading(),
-                    )
-                    .wrap(),
-                );
-                ui.add_space(10.0);
-                ui.label("挂载镜像：");
-                ui.add(
-                    egui::Label::new(confirmation.image.image_path.display().to_string()).wrap(),
-                );
-                ui.add_space(10.0);
-                ui.label("卸载后已保存的修改仍保留，请先保存并关闭盘内文件。");
-                ui.add_space(16.0);
-                control_row(ui, |ui| {
-                    let response = ui.add(button("取消"));
-                    if confirmation.focus_cancel {
-                        response.request_focus();
-                        confirmation.focus_cancel = false;
-                    }
-                    dismiss = response.clicked();
-                    confirm = ui
-                        .add_enabled(self.disk_busy.is_none(), primary("卸载", 80.0))
-                        .clicked();
+                            dismiss = response.clicked();
+                        });
+                    });
                 });
-            });
             if confirm {
                 let image = self.eject.take().unwrap().image;
                 self.unmount(image.image_path);
@@ -1681,6 +1740,25 @@ fn brand_icon(ui: &mut egui::Ui, texture: &egui::TextureHandle) {
         egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
         Color32::WHITE,
     );
+}
+
+fn eject_warning_icon(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(22.0), egui::Sense::hover());
+    let center = rect.center();
+    ui.painter()
+        .circle_filled(center, 10.0, Color32::from_rgb(238, 159, 35));
+    ui.painter().line_segment(
+        [center + Vec2::new(0.0, -5.0), center + Vec2::new(0.0, 1.0)],
+        Stroke::new(2.0, Color32::WHITE),
+    );
+    ui.painter()
+        .circle_filled(center + Vec2::new(0.0, 5.0), 1.2, Color32::WHITE);
+}
+
+fn eject_path_field(ui: &mut egui::Ui, label: &str, path: &str) {
+    ui.label(RichText::new(label).size(12.0).color(MUTED));
+    // Label supplies its own full-text tooltip only when it is elided.
+    ui.add(egui::Label::new(RichText::new(path).size(14.0).color(TEXT)).truncate());
 }
 
 fn install_style(ctx: &egui::Context) {
@@ -2093,11 +2171,27 @@ mod tests {
         // egui sizes a newly opened Area in an invisible first pass.
         let _ = ctx.run(input(vec![]), |ctx| app.dialogs(ctx));
         let output = ctx.run(input(vec![]), |ctx| app.dialogs(ctx));
-        let heading = text_rect(&output.shapes, &format!("确认卸载 {folder}？"));
+        let heading = text_rect(&output.shapes, "确认卸载镜像？");
+        let guidance = text_rect(&output.shapes, "请先保存并关闭盘内文件。");
+        assert!((heading.left() - guidance.left()).abs() < 1.0);
+        let mount_path = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(shape) if shape.galley.job.text == folder => Some(&shape.galley),
+                _ => None,
+            })
+            .expect("The mount point must remain in the information block");
+        assert_eq!(mount_path.rows.len(), 1, "Long paths must stay on one line");
         assert!(
-            heading.width() <= 461.0,
-            "Long mount paths must wrap in the modal"
+            mount_path.elided,
+            "Long paths should truncate without widening the modal"
         );
+        assert!(mount_path.rect.width() <= 375.0);
+        let cancel = text_rect(&output.shapes, "取消");
+        let confirm = text_rect(&output.shapes, "卸载镜像");
+        assert!(cancel.right() < confirm.left());
+        assert!((cancel.center().y - confirm.center().y).abs() < 1.0);
         assert!(app.disk_busy.is_none());
     }
 
