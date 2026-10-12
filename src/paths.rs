@@ -58,14 +58,48 @@ pub fn partial_path(path: &Path) -> PathBuf {
 }
 
 pub fn default_diff(base: &Path) -> Result<PathBuf> {
-    let format = image_format(base)?;
+    Ok(crate::config::exe_dir()
+        .join("diffs")
+        .join(diff_file_name(base)?))
+}
+
+/// Replace only the filename; a bare current filename stays relative to the exe.
+/// This computes a path and never renames or moves an existing image.
+pub fn diff_for_base(base: &Path, current_diff: &Path) -> Result<PathBuf> {
+    if current_diff.as_os_str().is_empty() {
+        return default_diff(base);
+    }
+    let name = diff_file_name(base)?;
+    Ok(current_diff.parent().unwrap_or(current_diff).join(name))
+}
+
+fn diff_file_name(base: &Path) -> Result<std::ffi::OsString> {
+    // Partial image files are supported elsewhere, but cannot be chosen as bases.
+    let extension = base
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let suffix = if extension.eq_ignore_ascii_case("vhdx") {
+        ".diff.vhdx"
+    } else if extension.eq_ignore_ascii_case("vhd") {
+        ".diff.vhd"
+    } else {
+        bail!("基础镜像仅支持 .vhd 和 .vhdx");
+    };
+    let filename = base
+        .file_name()
+        .context("基础镜像缺少文件名")?
+        .to_string_lossy();
+    if filename
+        .chars()
+        .any(|c| c.is_control() || "<>:\"|?*".contains(c))
+    {
+        bail!("基础镜像文件名无效");
+    }
     let stem = base.file_stem().context("基础镜像缺少文件名")?;
     let mut name = stem.to_os_string();
-    name.push(match format {
-        ImageFormat::Vhd => "-diff.vhd",
-        ImageFormat::Vhdx => "-diff.vhdx",
-    });
-    Ok(crate::config::exe_dir().join("diffs").join(name))
+    name.push(suffix);
+    Ok(name)
 }
 
 fn comparison_key(path: &Path) -> String {
@@ -155,9 +189,41 @@ mod tests {
                 default_diff(Path::new(&format!("archive.{extension}"))).unwrap(),
                 crate::config::exe_dir()
                     .join("diffs")
-                    .join(format!("archive-diff.{extension}"))
+                    .join(format!("archive.diff.{extension}"))
             );
         }
+    }
+    #[test]
+    fn replacement_keeps_relative_and_bare_directories_and_complex_stems() {
+        for current in ["custom/work.vhdx", "./custom/work.vhdx", "work.vhdx"] {
+            let path = Path::new(current);
+            assert_eq!(
+                diff_for_base(Path::new("资料 空格.v2.VHD"), path).unwrap(),
+                path.parent().unwrap().join("资料 空格.v2.diff.vhd")
+            );
+        }
+        assert_eq!(
+            diff_for_base(Path::new("archive.vhdx"), Path::new("")).unwrap(),
+            default_diff(Path::new("archive.vhdx")).unwrap()
+        );
+        assert!(diff_for_base(Path::new("archive.vhdx.partial"), Path::new("work.vhdx")).is_err());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn replacement_keeps_custom_absolute_directory_and_drive_root() {
+        assert_eq!(
+            diff_for_base(
+                Path::new(r"\\NAS\backup\new.vhdx"),
+                Path::new(r"D:\My Diffs\old.vhd")
+            )
+            .unwrap(),
+            PathBuf::from(r"D:\My Diffs\new.diff.vhdx")
+        );
+        assert_eq!(
+            diff_for_base(Path::new("new.vhdx"), Path::new(r"D:\")).unwrap(),
+            PathBuf::from(r"D:\new.diff.vhdx")
+        );
     }
     #[test]
     fn rejects_unsupported() {

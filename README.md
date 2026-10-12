@@ -43,11 +43,11 @@ Windows 便携式 VHDX 镜像制作与 VHD/VHDX 差分挂载工具。
 ## 挂载 NAS 镜像
 
 1. 基础镜像填 `\\NAS\backup\Archive.vhdx`，推荐使用 UNC 地址而不是映射盘符。
-2. 差分默认 `.\diffs\Archive-diff.vhdx`，也可选择如 `D:\Diff\Archive-diff.vhdx`。挂载时会自动创建缺失的目录；已保存的差分路径保持不变。
+2. 差分默认 `.\diffs\Archive.diff.vhdx`，也可选择如 `D:\Diff\Archive.diff.vhdx`。切换基础镜像时保留当前差分目录，只将文件名更新为新基础镜像名加 `.diff.vhd` 或 `.diff.vhdx`。启动时保留已保存的完整地址；挂载时自动创建缺失的目录。
 3. 在“挂载位置”选择 **盘符** 或 **文件夹**。盘符支持自动分配；文件夹模式选择已有的本地 NTFS 空目录，例如 `D:\Mounts\Archive`，再点击 **挂载**。
 4. 在下方列表点击文件夹图标打开磁盘，点击弹出图标并确认后卸载。
 
-所有相对路径固定相对于 **exe 所在目录**；界面显示实际绝对路径。例如软件位于 `D:\VhdxDock\VhdxDock.exe`，默认差分文件就是 `D:\VhdxDock\diffs\Archive-diff.vhdx`。差分必须放本地，大小会随修改增加。如果 exe 在 C 盘而希望写入 D 盘，请修改差分路径。
+所有相对路径固定相对于 **exe 所在目录**；界面显示实际绝对路径。例如软件位于 `D:\VhdxDock\VhdxDock.exe`，默认差分文件就是 `D:\VhdxDock\diffs\Archive.diff.vhdx`。差分必须放本地，大小会随修改增加。如果 exe 在 C 盘而希望写入 D 盘，请修改差分路径。
 
 差分仅保存变化，**不能脱离基础镜像使用**。卸载不会丢弃修改；关闭工具窗口也不会卸载已挂载磁盘。基础镜像在被差分依赖后必须保持原样，不要直接写入、合并、替换或重建。NAS 权限和 Windows 凭据由系统管理，本工具不保存密码。
 

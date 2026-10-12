@@ -82,8 +82,7 @@ pub struct DockApp {
     logs: VecDeque<String>,
     log_tx: Option<mpsc::Sender<LogCommand>>,
     notice: Option<(String, bool)>,
-    diff_manual: bool,
-    last_auto_base: String,
+    last_base: String,
     eject: Option<EjectConfirmation>,
     open_volumes: Option<Vec<String>>,
     close_confirmation: bool,
@@ -115,13 +114,7 @@ impl DockApp {
 
     fn with_settings(settings: AppConfig) -> Self {
         let (tx, rx) = mpsc::channel();
-        let diff_manual = !settings.diff_path.trim().is_empty()
-            && !Self::resolved(&settings.base_path)
-                .and_then(|base| paths::default_diff(&base).map_err(|e| e.to_string()))
-                .ok()
-                .zip(Self::resolved(&settings.diff_path).ok())
-                .is_some_and(|(default, actual)| paths::same_path(&default, &actual));
-        let last_auto_base = settings.base_path.clone();
+        let last_base = settings.base_path.clone();
         Self {
             settings,
             brand_texture: None,
@@ -138,8 +131,7 @@ impl DockApp {
             logs: VecDeque::new(),
             log_tx: None,
             notice: None,
-            diff_manual,
-            last_auto_base,
+            last_base,
             eject: None,
             open_volumes: None,
             close_confirmation: false,
@@ -160,7 +152,7 @@ impl DockApp {
         install_style(ctx);
         let settings = AppConfig {
             base_path: r"\\NAS\backup\Archive.vhdx".into(),
-            diff_path: r"D:\VhdxDock\diffs\Archive-diff.vhdx".into(),
+            diff_path: r"D:\VhdxDock\diffs\Archive.diff.vhdx".into(),
             source_path: r"D:\Data\Archive".into(),
             output_path: r"D:\Images\Archive.vhdx".into(),
             ..Default::default()
@@ -169,7 +161,7 @@ impl DockApp {
         app.preview_mode = true;
         app.disks = vec![
             MountedImage {
-                image_path: PathBuf::from(r"D:\VhdxDock\diffs\Archive-diff.vhdx"),
+                image_path: PathBuf::from(r"D:\VhdxDock\diffs\Archive.diff.vhdx"),
                 parent_path: Some(PathBuf::from(r"\\NAS\backup\Archive.vhdx")),
                 volumes: vec![r"F:\".into()],
                 kind: "差分 VHDX".into(),
@@ -178,7 +170,7 @@ impl DockApp {
                 warning: None,
             },
             MountedImage {
-                image_path: PathBuf::from(r"D:\VhdxDock\diffs\Photos-diff.vhd"),
+                image_path: PathBuf::from(r"D:\VhdxDock\diffs\Photos.diff.vhd"),
                 parent_path: Some(PathBuf::from(r"\\NAS\backup\Photos.vhd")),
                 volumes: vec![r"G:\".into()],
                 kind: "差分 VHD".into(),
@@ -201,7 +193,7 @@ impl DockApp {
                 "VhdxDock 已启动",
                 "已刷新挂载列表：2 个镜像",
                 r"基础镜像：\\NAS\backup\Archive.vhdx",
-                r"本地差分：D:\VhdxDock\diffs\Archive-diff.vhdx",
+                r"本地差分：D:\VhdxDock\diffs\Archive.diff.vhdx",
                 "镜像已挂载，修改将保存在差分盘中",
             ]
             .into_iter()
@@ -262,20 +254,39 @@ impl DockApp {
         paths::resolve(Path::new(input.trim())).map_err(|e| format!("路径无效：{e:#}"))
     }
 
-    fn set_default_diff(&mut self) {
-        if !self.diff_manual && !self.settings.base_path.trim().is_empty() {
-            // A partially typed base path is normal while editing this field.
-            if let Ok(path) = Self::resolved(&self.settings.base_path)
-                .and_then(|base| paths::default_diff(&base).map_err(|e| format!("{e:#}")))
-            {
-                self.settings.diff_path = path
-                    .strip_prefix(config::exe_dir())
-                    .map(|relative| format!(".{}{}", std::path::MAIN_SEPARATOR, relative.display()))
-                    .unwrap_or_else(|_| path.display().to_string());
-            }
+    fn sync_diff_with_base(&mut self) {
+        if self.last_base == self.settings.base_path {
+            return;
         }
-        self.last_auto_base = self.settings.base_path.clone();
+        let previous = std::mem::replace(&mut self.last_base, self.settings.base_path.clone());
         self.config_dirty = true;
+        let Ok(base) = Self::resolved(&self.settings.base_path) else {
+            return;
+        };
+        if Self::resolved(&previous).ok().is_some_and(|old| {
+            #[cfg(windows)]
+            {
+                old.to_string_lossy()
+                    .eq_ignore_ascii_case(&base.to_string_lossy())
+            }
+            #[cfg(not(windows))]
+            {
+                old == base
+            }
+        }) {
+            return;
+        }
+        // Keep editing and invalid bases from destroying the user's current path.
+        let current = self.settings.diff_path.trim();
+        if let Ok(path) = paths::diff_for_base(&base, Path::new(current)) {
+            self.settings.diff_path = if current.is_empty() {
+                path.strip_prefix(config::exe_dir())
+                    .map(|relative| format!(".{}{}", std::path::MAIN_SEPARATOR, relative.display()))
+                    .unwrap_or_else(|_| path.display().to_string())
+            } else {
+                path.display().to_string()
+            };
+        }
     }
 
     fn refresh(&mut self) {
@@ -598,7 +609,7 @@ impl DockApp {
                 let base_changed =
                     path_input(ui, "基础镜像", &mut self.settings.base_path, Browse::Image);
                 if base_changed {
-                    self.set_default_diff();
+                    self.sync_diff_with_base();
                 }
                 ui.add_space(9.0);
                 if path_input(
@@ -607,7 +618,6 @@ impl DockApp {
                     &mut self.settings.diff_path,
                     Browse::SaveDiff,
                 ) {
-                    self.diff_manual = !self.settings.diff_path.trim().is_empty();
                     self.config_dirty = true;
                 }
                 ui.horizontal_wrapped(|ui| {
@@ -1167,8 +1177,7 @@ impl DockApp {
                     );
                     if ui.add(button("填入挂载页面")).clicked() {
                         self.settings.base_path = result.output.display().to_string();
-                        self.diff_manual = false;
-                        self.set_default_diff();
+                        self.sync_diff_with_base();
                         self.tab = Tab::Mount;
                     }
                 }
@@ -1316,12 +1325,10 @@ impl eframe::App for DockApp {
                 })
             {
                 self.settings.base_path = path.display().to_string();
-                self.set_default_diff();
+                self.sync_diff_with_base();
             }
         }
-        if self.last_auto_base != self.settings.base_path {
-            self.set_default_diff();
-        }
+        self.sync_diff_with_base();
         egui::TopBottomPanel::bottom("status_bar")
             .frame(
                 egui::Frame::new()
@@ -1528,7 +1535,7 @@ fn path_input(ui: &mut egui::Ui, label: &str, value: &mut String, kind: Browse) 
                     .min_size(Vec2::new(0.0, CONTROL_HEIGHT))
                     .hint_text(match kind {
                         Browse::Image => r"本地路径或 \\NAS\共享\镜像.vhdx",
-                        Browse::SaveDiff => r".\diffs\镜像-diff.vhdx",
+                        Browse::SaveDiff => r".\diffs\镜像.diff.vhdx",
                         Browse::Folder => r"E:\需要归档的文件夹",
                         Browse::SaveVhdx => r"D:\Backup\镜像-base.vhdx",
                     }),
@@ -2217,27 +2224,99 @@ mod tests {
     }
 
     #[test]
-    fn manual_diff_survives_base_changes_and_reload() {
-        let settings = AppConfig {
-            base_path: "first.vhdx".into(),
-            diff_path: "custom/work.vhdx".into(),
+    fn base_changes_keep_the_diff_directory_across_reload_and_formats() {
+        let absolute = config::exe_dir()
+            .join("custom child directory")
+            .join("work.vhdx");
+        for original in [
+            absolute,
+            PathBuf::from("custom/work.vhdx"),
+            PathBuf::from("work.vhdx"),
+        ] {
+            let mut app = DockApp::with_settings(AppConfig {
+                base_path: "first.vhdx".into(),
+                diff_path: original.display().to_string(),
+                ..Default::default()
+            });
+            app.settings.base_path = "归档 多点.v2.VHD".into();
+            app.sync_diff_with_base();
+            let directory = original.parent().unwrap();
+            assert_eq!(
+                PathBuf::from(&app.settings.diff_path),
+                directory.join("归档 多点.v2.diff.vhd")
+            );
+            let persisted = serde_json::to_string(&app.settings).unwrap();
+            let mut reloaded = DockApp::with_settings(serde_json::from_str(&persisted).unwrap());
+            reloaded.settings.base_path = "third.vhdx".into();
+            reloaded.sync_diff_with_base();
+            assert_eq!(
+                PathBuf::from(&reloaded.settings.diff_path),
+                directory.join("third.diff.vhdx")
+            );
+        }
+    }
+
+    #[test]
+    fn unchanged_or_invalid_base_keeps_saved_and_handwritten_diff_names() {
+        let mut app = DockApp::with_settings(AppConfig {
+            base_path: "archive.vhdx".into(),
+            diff_path: "diffs/archive-diff.vhdx".into(),
             ..Default::default()
-        };
-        let mut app = DockApp::with_settings(settings);
-        assert!(app.diff_manual);
-        app.settings.base_path = "second.vhdx".into();
-        app.set_default_diff();
-        assert_eq!(app.settings.diff_path, "custom/work.vhdx");
-        app.diff_manual = false;
-        app.set_default_diff();
+        });
+        app.sync_diff_with_base();
+        assert_eq!(app.settings.diff_path, "diffs/archive-diff.vhdx");
+        assert!(
+            !app.config_dirty,
+            "Startup must not rewrite the existing config"
+        );
+        app.settings.diff_path = "custom/handwritten.vhdx".into();
+        app.sync_diff_with_base();
+        assert_eq!(
+            app.settings.diff_path, "custom/handwritten.vhdx",
+            "Repeating a base selection must not overwrite the hand-entered filename"
+        );
+        app.settings.base_path = DockApp::resolved("archive.vhdx")
+            .unwrap()
+            .display()
+            .to_string();
+        app.sync_diff_with_base();
+        assert_eq!(
+            app.settings.diff_path, "custom/handwritten.vhdx",
+            "Equivalent absolute and relative base paths refer to the same image"
+        );
+        for base in [
+            "",
+            "archive.",
+            "archive.vhdx.partial",
+            "archive.iso",
+            "bad?.vhdx",
+        ] {
+            app.settings.base_path = base.into();
+            app.sync_diff_with_base();
+            assert_eq!(
+                app.settings.diff_path, "custom/handwritten.vhdx",
+                "Invalid or incomplete base: {base}"
+            );
+        }
+        app.settings.base_path = "new.vhdx".into();
+        app.sync_diff_with_base();
+        assert_eq!(
+            PathBuf::from(&app.settings.diff_path),
+            PathBuf::from("custom/new.diff.vhdx")
+        );
+    }
+
+    #[test]
+    fn empty_diff_uses_default_directory_only_after_a_base_change() {
+        let mut app = DockApp::with_settings(AppConfig::default());
+        app.sync_diff_with_base();
+        assert!(app.settings.diff_path.is_empty());
+        app.settings.base_path = "archive.vhdx".into();
+        app.sync_diff_with_base();
+        assert!(!Path::new(&app.settings.diff_path).is_absolute());
         assert_eq!(
             DockApp::resolved(&app.settings.diff_path).unwrap(),
-            config::exe_dir().join("diffs").join("second-diff.vhdx")
-        );
-        let reloaded = DockApp::with_settings(app.settings);
-        assert!(
-            !reloaded.diff_manual,
-            "Automatically generated paths should remain automatic across restarts"
+            config::exe_dir().join("diffs/archive.diff.vhdx")
         );
     }
 
