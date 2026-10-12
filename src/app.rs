@@ -816,11 +816,6 @@ impl DockApp {
                 ui.add_space(15.0);
                 ui.vertical_centered(|ui| {
                     ui.label(RichText::new("尚无已挂载镜像").color(MUTED).size(16.0));
-                    ui.label(
-                        RichText::new("挂载后将在这里显示，可同时管理多个磁盘")
-                            .color(MUTED)
-                            .size(12.0),
-                    );
                 });
                 ui.add_space(20.0);
             } else {
@@ -834,56 +829,37 @@ impl DockApp {
                     .spacing([12.0, 12.0])
                     .striped(true)
                     .show(ui, |ui| {
-                        for header in ["挂载位置 / 状态", "挂载镜像", "基础镜像", "操作"]
-                        {
+                        for header in ["挂载点", "基础镜像", "差分镜像", "操作"] {
                             ui.label(RichText::new(header).size(12.0).color(MUTED));
                         }
                         ui.end_row();
                         for disk in &self.disks {
-                            ui.vertical(|ui| {
-                                ui.set_width(location_width);
-                                truncated_path(
-                                    ui,
-                                    &if disk.volumes.is_empty() {
-                                        "无挂载位置".into()
-                                    } else {
-                                        disk.volumes.join("  ")
-                                    },
-                                    location_width,
-                                );
-                                ui.label(
-                                    RichText::new(if disk.read_only {
-                                        "只读"
-                                    } else {
-                                        "可读写"
-                                    })
-                                    .size(11.0)
-                                    .color(if disk.read_only { MUTED } else { ACCENT }),
-                                );
-                            });
-                            ui.vertical(|ui| {
-                                truncated_path(
-                                    ui,
-                                    &disk.image_path.display().to_string(),
-                                    path_width,
-                                );
-                                ui.label(RichText::new(&disk.kind).color(MUTED).size(11.0));
-                                if let Some(warning) = &disk.warning {
-                                    ui.label(
-                                        RichText::new("需注意")
-                                            .color(Color32::from_rgb(160, 95, 20))
-                                            .size(11.0),
-                                    )
-                                    .on_hover_text(warning);
-                                }
-                            });
+                            truncated_path(
+                                ui,
+                                &if disk.volumes.is_empty() {
+                                    "—".into()
+                                } else {
+                                    disk.volumes.join("  ")
+                                },
+                                location_width,
+                            );
                             truncated_path(
                                 ui,
                                 &disk
                                     .parent_path
                                     .as_ref()
-                                    .map(|p| p.display().to_string())
-                                    .unwrap_or_else(|| "直接挂载".into()),
+                                    .unwrap_or(&disk.image_path)
+                                    .display()
+                                    .to_string(),
+                                path_width,
+                            );
+                            truncated_path(
+                                ui,
+                                &if disk.parent_path.is_some() {
+                                    disk.image_path.display().to_string()
+                                } else {
+                                    "—".into()
+                                },
                                 path_width,
                             );
                             ui.allocate_ui_with_layout(
@@ -907,11 +883,11 @@ impl DockApp {
                                         ui,
                                         Icon::Eject,
                                         disk.can_eject && self.disk_busy.is_none(),
-                                        if disk.can_eject {
+                                        disk.warning.as_deref().unwrap_or(if disk.can_eject {
                                             "卸载磁盘"
                                         } else {
                                             "此磁盘受保护，不能在此卸载"
-                                        },
+                                        }),
                                     )
                                     .clicked()
                                     {
@@ -923,11 +899,6 @@ impl DockApp {
                         }
                     });
             }
-            ui.label(
-                RichText::new("关闭软件后磁盘继续挂载；弹出保留差分中的修改。")
-                    .size(12.0)
-                    .color(MUTED),
-            );
         });
         if let Some(volumes) = open {
             self.open_disk(volumes);
@@ -1582,7 +1553,7 @@ fn path_input(ui: &mut egui::Ui, label: &str, value: &mut String, kind: Browse) 
 
 fn truncated_path(ui: &mut egui::Ui, path: &str, width: f32) {
     ui.allocate_ui_with_layout(
-        Vec2::new(width, 23.0),
+        Vec2::new(width, CONTROL_HEIGHT),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
             ui.set_min_width(width);
@@ -2053,7 +2024,7 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| app.mounted_list(ui));
         });
         assert!(text_rect(&output.shapes, "操作").right() < 860.0);
-        assert!(rendered_text(&output.shapes).contains("挂载位置 / 状态"));
+        assert!(rendered_text(&output.shapes).contains("挂载点"));
         app.eject = Some(EjectConfirmation {
             image: mounted,
             focus_cancel: true,
