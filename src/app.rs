@@ -83,6 +83,7 @@ pub struct DockApp {
     log_tx: Option<mpsc::Sender<LogCommand>>,
     notice: Option<(String, bool)>,
     last_base: String,
+    last_valid_base: String,
     eject: Option<EjectConfirmation>,
     open_volumes: Option<Vec<String>>,
     close_confirmation: bool,
@@ -131,6 +132,7 @@ impl DockApp {
             logs: VecDeque::new(),
             log_tx: None,
             notice: None,
+            last_valid_base: last_base.clone(),
             last_base,
             eject: None,
             open_volumes: None,
@@ -258,11 +260,18 @@ impl DockApp {
         if self.last_base == self.settings.base_path {
             return;
         }
-        let previous = std::mem::replace(&mut self.last_base, self.settings.base_path.clone());
+        self.last_base = self.settings.base_path.clone();
         self.config_dirty = true;
         let Ok(base) = Self::resolved(&self.settings.base_path) else {
             return;
         };
+        // Invalid edits are observed once, but never replace the valid anchor.
+        let current = self.settings.diff_path.trim();
+        let Ok(path) = paths::diff_for_base(&base, Path::new(current)) else {
+            return;
+        };
+        let previous =
+            std::mem::replace(&mut self.last_valid_base, self.settings.base_path.clone());
         if Self::resolved(&previous).ok().is_some_and(|old| {
             #[cfg(windows)]
             {
@@ -276,17 +285,13 @@ impl DockApp {
         }) {
             return;
         }
-        // Keep editing and invalid bases from destroying the user's current path.
-        let current = self.settings.diff_path.trim();
-        if let Ok(path) = paths::diff_for_base(&base, Path::new(current)) {
-            self.settings.diff_path = if current.is_empty() {
-                path.strip_prefix(config::exe_dir())
-                    .map(|relative| format!(".{}{}", std::path::MAIN_SEPARATOR, relative.display()))
-                    .unwrap_or_else(|_| path.display().to_string())
-            } else {
-                path.display().to_string()
-            };
-        }
+        self.settings.diff_path = if current.is_empty() {
+            path.strip_prefix(config::exe_dir())
+                .map(|relative| format!(".{}{}", std::path::MAIN_SEPARATOR, relative.display()))
+                .unwrap_or_else(|_| path.display().to_string())
+        } else {
+            path.display().to_string()
+        };
     }
 
     fn refresh(&mut self) {
@@ -2287,16 +2292,34 @@ mod tests {
         for base in [
             "",
             "archive.",
+            "archive.vhdxX",
             "archive.vhdx.partial",
             "archive.iso",
             "bad?.vhdx",
         ] {
+            app.config_dirty = false;
             app.settings.base_path = base.into();
             app.sync_diff_with_base();
+            assert!(app.config_dirty, "An invalid edit is still a config change");
             assert_eq!(
                 app.settings.diff_path, "custom/handwritten.vhdx",
                 "Invalid or incomplete base: {base}"
             );
+            app.config_dirty = false;
+            app.sync_diff_with_base();
+            assert!(
+                !app.config_dirty,
+                "Unchanged invalid input must not dirty every frame"
+            );
+            app.settings.base_path = "archive.vhdx".into();
+            app.sync_diff_with_base();
+            assert_eq!(
+                app.settings.diff_path, "custom/handwritten.vhdx",
+                "Undoing invalid input must retain the custom name: {base}"
+            );
+            app.config_dirty = false;
+            app.sync_diff_with_base();
+            assert!(!app.config_dirty, "The restored valid base must stabilize");
         }
         app.settings.base_path = "new.vhdx".into();
         app.sync_diff_with_base();
