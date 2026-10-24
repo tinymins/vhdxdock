@@ -1,5 +1,6 @@
 //! Explicitly opted-in, elevated Windows integration tests. Each case formats
 //! only a brand-new image under its dedicated temporary directory.
+//! Mounting children also persists their GUIDs in ScheduledDefrag's exclusions.
 #![cfg(windows)]
 
 use anyhow::{bail, ensure, Context, Result};

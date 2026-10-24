@@ -1,6 +1,7 @@
 #![cfg(windows)]
-//! Opt-in, elevated integration tests. Every writable object belongs to this
-//! test's fresh tempfile directory; existing images are never selected.
+//! Opt-in, elevated integration tests. Writable disk fixtures belong to this
+//! test's fresh tempfile directory; existing images are never selected. Mounts
+//! also persist the scratch volume GUIDs in ScheduledDefrag's exclusion list.
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::{

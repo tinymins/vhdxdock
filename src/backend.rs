@@ -529,6 +529,8 @@ ConvertTo-Json -InputObject @{ok=$true} -Compress
                     &json!({"physical":virtual_disk::physical_path(&diff)?}),
                 )?;
             }
+            crate::optimization::protect(&virtual_disk::physical_path(&diff)?)
+                .context("差分盘已挂载，但无法排除 Windows 计划优化；请先弹出镜像")?;
             return Ok(rows);
         }
         virtual_disk::attach(&diff)?;
@@ -541,6 +543,8 @@ ConvertTo-Json -InputObject @{ok=$true} -Compress
                 ASSIGN_VOLUMES,
                 &json!({"physical": physical, "letter": request.drive_letter.map(|c| c.to_ascii_uppercase().to_string()), "folder":folder.as_deref().map(access_root)}),
             )?;
+            crate::optimization::protect(&physical)
+                .context("无法排除 Windows 计划优化，取消本次挂载")?;
             let rows = wait_for_mount_rows(&diff).with_context(|| {
                 format!("镜像已连接，但挂载状态未通过检查。分配挂载路径后的快照：{assignment}")
             })?;
