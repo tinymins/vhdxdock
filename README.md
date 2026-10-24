@@ -6,7 +6,7 @@ Windows 便携式 VHDX 镜像制作与 VHD/VHDX 差分挂载工具。
 
 将文件夹封装为单个基础镜像；基础镜像可以保存在 NAS，本地差分盘承接所有修改。挂载后作为普通 Windows 磁盘使用，卸载、重新挂载后修改仍然保留。
 
-> 开发预览版本。自动化测试只使用临时小镜像；实际 NAS 的 SMB、权限、断线行为需要在你的环境验证。请保留原数据，完成备份校验后再决定是否清理。
+> 自动化测试只使用临时小镜像；实际 NAS 的 SMB、权限、断线行为需要在你的环境验证。请保留原数据，完成备份校验后再决定是否清理。
 
 ## 界面预览
 
@@ -50,7 +50,7 @@ Windows 便携式 VHDX 镜像制作与 VHD/VHDX 差分挂载工具。
 
 ## 获取与运行
 
-在 [Releases](https://github.com/tinymins/vhdxdock/releases) 下载 Windows x64 预览版，或在 [Actions](https://github.com/tinymins/vhdxdock/actions) 的成功构建中下载 `VhdxDock-windows-x64`。解压到本地可写目录，运行 `VhdxDock.exe`。
+在 [Releases](https://github.com/tinymins/vhdxdock/releases) 下载 Windows x64 正式版，或在 [Actions](https://github.com/tinymins/vhdxdock/actions) 的成功构建中下载 `VhdxDock-windows-x64`。解压到本地可写目录，运行 `VhdxDock.exe`。
 
 - Windows 10 / 11 x64；依赖系统内置 PowerShell 5.1、Storage 模块和 Robocopy。
 - 启动时请求管理员权限。取消授权后退出。
